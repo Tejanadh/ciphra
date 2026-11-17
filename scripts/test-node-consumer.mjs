@@ -42,9 +42,12 @@ prover.terminate();
     try { await prover.start(); } finally { prover.terminate(); }
   `]);
   await cp(join(root, "fixtures"), join(consumer, "fixtures"), { recursive: true });
+  await cp(join(root, "examples/node"), join(consumer, "examples/node"), { recursive: true });
+  await command(join(consumer, "node_modules/.bin/tsc"), ["-p", "examples/node/tsconfig.json"]);
+  await command(process.execPath, ["examples/node/prove.ts"]);
   const test = (await readFile(join(root, "scripts/test-node.mjs"), "utf8"))
     .replace('"../packages/web-prover/dist/node/index.js"', '"@heliuslabs/spr-web-prover/node"')
-    .replace('"../fixtures/', '"./fixtures/');
+    .replaceAll('"../fixtures/', '"./fixtures/');
   await writeFile(join(consumer, "test-node.mjs"), test);
   console.log(await command(process.execPath, ["test-node.mjs"], consumer, { ...process.env, SPR_TEST_GPU: "0", SPR_TEST_NO_GPU: "1" }));
   if (process.env.SPR_TEST_GPU === "1") {

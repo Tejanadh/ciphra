@@ -46,7 +46,7 @@ The default pool uses available processors, capped at 18. More threads are not
 always faster, especially with a GPU; benchmark your request shapes and host.
 The Node entry caches validated downloads and decoded keys in
 `~/.cache/spr-prover`. Set `cacheDir` to another directory or `false` to disable
-disk caching. Reusing an instance keeps the current shape resident; `prefetch`
+disk caching. Reusing an instance keeps loaded key state available; `prefetch`
 prepares other shapes in the disk cache. Only public proving keys are persisted,
 never requests or witnesses. No globals are installed in your application's thread.
 
@@ -65,6 +65,37 @@ Run `npm run bench:node` in this repository to measure your host. First use also
 requires downloading and decoding the proving key; `prefetch()` during
 application startup moves that preparation ahead of a spend. Keep the prover
 instance alive to retain its current shape in memory.
+
+### Keep frequently used shapes loaded
+
+The default retains one shape. Opt in to a bounded LRU cache on hosts with
+memory to spare:
+
+```ts
+const prover = new SprNodeProver({
+  proverUrl: "http://localhost:3001",
+  residentKeyBudgetBytes: 512 * 1024 ** 2,
+});
+await prover.ensureKey(shapeByLabel("2x2"));
+await prover.ensureKey(shapeByLabel("8x2"));
+```
+
+Both shapes can now be selected without reading or rebuilding their keys.
+The cache shares one worker and thread pool. It evicts the least recently used
+shape before admitting another; a shape exceeding the budget runs alone.
+`loadedKeys()` reports the current residents. Termination or active cancellation
+clears them; the disk cache survives.
+
+The budget is **estimated key state**, not a hard RSS/GPU memory cap: each key
+is charged the larger of 8× its pinned compressed size and 3× its decoded byte
+size, when available. The option is capped at 1 GiB to leave headroom in the
+WASM32 runtime; decoding, proof buffers, workers and allocator retention need
+additional memory. Default `0` preserves single-shape behavior.
+
+`prefetch()` prepares disk entries and skips already cached shapes. Use
+`ensureKey()` for each shape you want resident; cache capacity still applies.
+See the [minimal TypeScript example](../../examples/node) and
+[alternating-shape measurements](../../benchmarks/node/2026-11-17-switching.md).
 
 ## Browser
 
@@ -230,7 +261,7 @@ await prover.prefetch({
 
 ## Lifecycle
 
-- The worker starts on first use. Work is serialized; one key is loaded at a time.
+- The worker starts on first use. Work is serialized; loaded shapes follow the resident-key budget (one by default).
 - `AbortSignal` cancels queued work; cancelling in-flight work tears down the runtime (it can restart via the retained factory).
 - `terminate()` stops the worker and disables auto-restart.
 - Failures surface as `WasmProverError` with a stable `code` (no witness or backend detail in the message).

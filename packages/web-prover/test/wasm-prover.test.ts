@@ -464,3 +464,8 @@ describe("worker error codes", () => {
     prover.terminate();
   });
 });
+
+
+it.each([-1, NaN, Infinity, 1.5, 1024 ** 3 + 1])("rejects invalid resident budget %s", (residentKeyBudgetBytes) => {
+  expect(() => new WasmProver({ proverUrl: "http://localhost:3001", residentKeyBudgetBytes })).toThrow(RangeError);
+});

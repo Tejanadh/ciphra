@@ -24,7 +24,7 @@ import { type ShapeKey } from "./shapes.js";
 
 /** Messages the worker understands. Mirrored by `prover.worker.ts`. */
 export type WorkerRequest =
-  | Readonly<{ id: number; kind: "init"; threads: number; gpu?: "auto" | "off" | "required" }>
+  | Readonly<{ id: number; kind: "init"; threads: number; gpu?: "auto" | "off" | "required"; residentKeyBudgetBytes?: number }>
   | Readonly<{
       id: number;
       kind: "loadKey";
@@ -35,7 +35,10 @@ export type WorkerRequest =
       keySha256: string;
       /** Ask for the raw form back, to cache. */
       exportRaw: boolean;
+      /** Pinned compressed size, for conservative resident-cache accounting. */
+      keyBytes?: number;
     }>
+  | Readonly<{ id: number; kind: "selectKey"; fileName: string; keySha256: string }>
   | Readonly<{ id: number; kind: "prove"; body: string }>
   | Readonly<{ id: number; kind: "loadedKeys" }>;
 
@@ -66,6 +69,12 @@ export type WorkerResponse = Readonly<{
 }>;
 
 export interface WasmProverOptions {
+  /**
+   * Opt-in LRU cache of loaded provers. 0 (default) keeps one shape.
+   * Estimated key-state budget, at most 1 GiB; not a process/GPU memory limit.
+   * Oversized keys run alone. Leave additional memory for decoding and proofs.
+   */
+  readonly residentKeyBudgetBytes?: number;
   /** GPU acceleration when available (default), CPU only, or fail if unavailable. */
   readonly gpu?: "auto" | "off" | "required";
   /** Override persistent key storage. Node uses a disk cache. */
@@ -154,13 +163,16 @@ export class WasmProver {
     number,
     Readonly<{ resolve: (value: WorkerResponse) => void; reject: (error: unknown) => void }>
   >();
-  /** The key the worker holds; one deserialized key is resident at a time. */
+  /** Resident keys reported by the worker after a load or selection. */
   readonly #loaded = new Set<string>();
   readonly #options: WasmProverOptions;
   readonly #store: KeyStore;
   readonly #fetch: typeof globalThis.fetch;
 
   constructor(options: WasmProverOptions) {
+    const budget = options.residentKeyBudgetBytes ?? 0;
+    if (!Number.isSafeInteger(budget) || budget < 0 || budget > 1024 ** 3)
+      throw new RangeError("residentKeyBudgetBytes must be an integer between 0 and 1 GiB");
     this.#options = options;
     this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.#factory = options.workerFactory ?? createProverWorker;
@@ -217,6 +229,9 @@ export class WasmProver {
       kind: "init",
       threads: this.#options.threads ?? automaticProvingThreads(),
       ...(this.#options.gpu === undefined ? {} : { gpu: this.#options.gpu }),
+      ...(this.#options.residentKeyBudgetBytes === undefined ? {} : {
+        residentKeyBudgetBytes: this.#options.residentKeyBudgetBytes,
+      }),
     })
       .then((ready) => {
         if (this.#worker !== worker) throw new WasmProverError("wasm_worker_terminated");
@@ -267,7 +282,7 @@ export class WasmProver {
    * shapes already kept are skipped. Each shape is queued on its own, so a proof
    * requested meanwhile runs after the shape in progress. Aborting skips the
    * remaining shapes; aborting the one in progress restarts the worker. Without
-   * the Cache API only the last shape stays loaded.
+   * the Cache API decoded forms are not persisted; the resident budget still applies.
    */
   async prefetch(
     options: Readonly<{
@@ -296,8 +311,7 @@ export class WasmProver {
 
   /**
    * Removes the kept keys, their decoded forms and interrupted downloads. A
-   * prefetch or proof in progress finishes first; the key the worker has loaded
-   * stays loaded.
+   * prefetch or proof in progress finishes first; resident keys stay loaded.
    */
   async clearKeys(signal?: AbortSignal): Promise<void> {
     await this.#enqueue((active) => this.#store.clear(active), signal);
@@ -311,6 +325,10 @@ export class WasmProver {
     await this.#ensureStarted(signal);
     const expected = this.#store.digest(shape);
     if (this.#loaded.has(shape.keyFile)) {
+      // Selecting also updates the worker's LRU order. A cache hit must change
+      // the active prover before the next proof, not merely skip the key fetch.
+      if ((this.#options.residentKeyBudgetBytes ?? 0) > 0)
+        await this.#call({ kind: "selectKey", fileName: shape.keyFile, keySha256: expected.keySha256 });
       // Reported rather than returned silently: a second sweep would otherwise
       // show a passing run with no steps, which reads as a lost measurement.
       this.#options.onMeasurement?.({
@@ -357,7 +375,7 @@ export class WasmProver {
     }
     signal.throwIfAborted();
     const info = response.value as
-      | Readonly<{ key?: string; inputs?: number; outputs?: number; raw?: unknown }>
+      | Readonly<{ key?: string; inputs?: number; outputs?: number; raw?: unknown; loadedKeys?: readonly string[] }>
       | undefined;
     this.#options.onMeasurement?.({
       step: "key-load",
@@ -378,7 +396,7 @@ export class WasmProver {
         signal,
       );
     this.#loaded.clear();
-    this.#loaded.add(shape.keyFile);
+    for (const keyFile of info?.loadedKeys ?? [shape.keyFile]) this.#loaded.add(keyFile);
   }
 
   #installKey(shape: ShapeKey, key: KeyBytes, expected: KeyDigest): Promise<WorkerResponse> {
@@ -390,6 +408,7 @@ export class WasmProver {
         keySha256: expected.keySha256,
         // The runtime's raw form, to keep in place of the pinned file.
         exportRaw: !key.raw && key.cacheable,
+        keyBytes: expected.size,
       },
       [key.bytes],
     );

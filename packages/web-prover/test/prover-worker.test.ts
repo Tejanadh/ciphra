@@ -31,7 +31,7 @@ vi.mock("../src/key-decoders.js", () => ({
   ]),
 }));
 
-beforeEach(async () => {
+async function setup(residentKeyBudgetBytes = 0) {
   vi.resetModules();
   scope = Object.assign(new EventTarget(), { postMessage: vi.fn() });
   prover = {
@@ -72,9 +72,10 @@ beforeEach(async () => {
   vi.stubGlobal("self", scope);
   vi.stubGlobal("crossOriginIsolated", true);
   await import("../src/prover.worker.js");
-  initialized = await send({ id: 1, kind: "init", threads: 2 });
+  initialized = await send({ id: 1, kind: "init", threads: 2, residentKeyBudgetBytes });
   expect(initialized.ok).toBe(true);
-});
+}
+beforeEach(() => setup());
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -173,4 +174,39 @@ it("fails a CPU proof that does not verify", async () => {
   const response = await send({ id: 3, kind: "prove", body: "{}" });
   expect(response).toMatchObject({ ok: false, error: "wasm_verify_failed" });
   expect(prover.drop_gpu).not.toHaveBeenCalled();
+});
+
+
+it("retains two shapes and evicts the least recently selected prover", async () => {
+  await setup(50); // Each synthetic key charges 24 bytes.
+  const entries = Array.from({ length: 3 }, () => ({ ...prover, free: vi.fn(), prove: vi.fn(async () => ({ proof: "{}", witnessMs: 1, proveMs: 2, verifyMs: 3 })) }));
+  for (const entry of entries) threaded.SprProver.mockImplementationOnce(function () { return entry; });
+  const load = (fileName: string) => send({ id: 2, kind: "loadKey", fileName, key: new Uint8Array(3).buffer, keySha256, exportRaw: false });
+  expect((await load("a")).ok).toBe(true);
+  expect((await load("b")).ok).toBe(true);
+  expect((await send({ id: 3, kind: "loadedKeys" })).value).toEqual({ keys: ["a", "b"] });
+  await send({ id: 4, kind: "selectKey", fileName: "a", keySha256 });
+  await send({ id: 5, kind: "prove", body: "{}" });
+  expect(entries[0]!.prove).toHaveBeenCalledOnce();
+  expect(entries[1]!.prove).not.toHaveBeenCalled();
+  await load("c");
+  expect(entries[1]!.free).toHaveBeenCalledOnce();
+  expect(entries[0]!.free).not.toHaveBeenCalled();
+  expect((await send({ id: 6, kind: "loadedKeys" })).value).toEqual({ keys: ["a", "c"] });
+  expect((await send({ id: 7, kind: "selectKey", fileName: "b", keySha256 })).ok).toBe(false);
+  expect((await send({ id: 8, kind: "selectKey", fileName: "a", keySha256: "bad" })).error).toBe("wasm_key_digest_mismatch");
+});
+
+it("runs an oversized key alone and releases it before a smaller key", async () => {
+  await setup(50);
+  const entries = Array.from({ length: 3 }, () => ({ ...prover, free: vi.fn() }));
+  for (const entry of entries) threaded.SprProver.mockImplementationOnce(function () { return entry; });
+  const load = (fileName: string, keyBytes: number) => send({ id: 2, kind: "loadKey", fileName, keyBytes, key: new Uint8Array(3).buffer, keySha256, exportRaw: false });
+  expect((await load("small", 3)).ok).toBe(true);
+  expect((await load("large", 100)).ok).toBe(true);
+  expect(entries[0]!.free).toHaveBeenCalledOnce();
+  expect((await send({ id: 3, kind: "loadedKeys" })).value).toEqual({ keys: ["large"] });
+  await load("small", 3);
+  expect(entries[1]!.free).toHaveBeenCalledOnce();
+  expect((await send({ id: 4, kind: "loadedKeys" })).value).toEqual({ keys: ["small"] });
 });

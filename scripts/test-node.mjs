@@ -23,7 +23,7 @@ try {
   for (const mode of modes) {
     const measurements = [];
     const prover = new SprNodeProver({
-      proverUrl: endpoint, cacheDir, ...mode,
+      proverUrl: endpoint, cacheDir, ...mode, residentKeyBudgetBytes: 512 * 1024 ** 2,
       onMeasurement: (m) => measurements.push(m),
       ...(cached ? { fetch: async () => { throw new Error("Cache reuse must not fetch"); } } : {}),
     });
@@ -72,7 +72,20 @@ try {
       await assert.rejects(interrupted, { name: "AbortError" });
       assert.ok((await prover.proveRequest(body)).proof);
       assert.deepEqual(await prover.loadedKeys(), [shapeByLabel("2x2").keyFile]);
-      console.log(JSON.stringify({ mode, verified: true, responsive: true, cached: true, cancellation: true }));
+      // Switching back must select the right resident prover, not reload its key.
+      await prover.ensureKey(shapeByLabel("8x2"));
+      assert.equal((await prover.loadedKeys()).length, 2);
+      measurements.length = 0;
+      assert.equal(JSON.parse((await prover.proveRequest(body)).proof).provingKeySha256, parsed.provingKeySha256);
+      assert.equal(measurements.filter((m) => m.step === "key-fetch").length, 0);
+      // Touching 2x2 makes 8x2 the eviction candidate when 4x2 arrives.
+      await prover.ensureKey(shapeByLabel("4x2"));
+      assert.deepEqual(await prover.loadedKeys(), [shapeByLabel("2x2").keyFile, shapeByLabel("4x2").keyFile]);
+      const wide = await readFile(new URL("../fixtures/transfer-8x2.json", import.meta.url), "utf8");
+      const wideProof = await prover.proveRequest(wide);
+      assert.equal(wideProof.backend, mode.gpu === "required" ? "gpu" : "cpu");
+      assert.notEqual(JSON.parse(wideProof.proof).provingKeySha256, parsed.provingKeySha256);
+      console.log(JSON.stringify({ mode, verified: true, responsive: true, cached: true, cancellation: true, residentSwitching: true, eviction: true }));
     } finally { prover.terminate(); }
   }
   assert.deepEqual({ Worker: globalThis.Worker, caches: globalThis.caches, navigator: globalThis.navigator }, originalGlobals);

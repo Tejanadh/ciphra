@@ -30,7 +30,36 @@ let runtime: Runtime | undefined;
 let pooled = false;
 let activeThreads = 0;
 let gpuAvailable = false;
-let loaded: { fileName: string; prover: SprProver } | undefined;
+type ResidentKey = { fileName: string; prover: SprProver; estimatedBytes: number };
+let loaded: ResidentKey | undefined;
+const residents = new Map<string, ResidentKey>();
+let residentBudget = 0;
+
+function evict(fileName: string): void {
+  const entry = residents.get(fileName);
+  if (entry === undefined) return;
+  if (loaded === entry) loaded = undefined;
+  residents.delete(fileName);
+  entry.prover.free();
+}
+
+function makeRoom(bytes: number): void {
+  let used = [...residents.values()].reduce((sum, entry) => sum + entry.estimatedBytes, 0);
+  for (const [name, entry] of residents) {
+    if (residentBudget > 0 && used + bytes <= residentBudget) break;
+    used -= entry.estimatedBytes;
+    evict(name);
+  }
+}
+
+function selectKey(fileName: string, digest: string): void {
+  const entry = residents.get(fileName);
+  if (entry === undefined) throw new WasmProverError("wasm_key_load_failed");
+  if (entry.prover.digest() !== digest) throw new WasmProverError("wasm_key_digest_mismatch");
+  residents.delete(fileName);
+  residents.set(fileName, entry);
+  loaded = entry;
+}
 
 // Rayon's helpers wait for every thread to report ready, and a thread whose script
 // the page refuses never does; a pool that has not started by then has failed.
@@ -39,8 +68,11 @@ const threadPoolTimeoutMs = 30_000;
 /** Magic of a cached raw key (`zopro-raw-3`); those skip worker decompression. */
 const rawKeyMagic = new TextEncoder().encode("zopro-raw3\0\0\0\0\0\0");
 
-async function init(threads: number, gpu: "auto" | "off" | "required" = "auto"): Promise<void> {
+async function init(threads: number, gpu: "auto" | "off" | "required" = "auto", budget = 0): Promise<void> {
   if (runtime !== undefined) return;
+  if (!Number.isSafeInteger(budget) || budget < 0 || budget > 1024 ** 3)
+    throw new Error("Invalid resident key budget");
+  residentBudget = budget;
   if (!Number.isInteger(threads) || threads < 0 || threads > 64) {
     throw new Error("Threads must be an integer between 0 and 64");
   }
@@ -110,10 +142,15 @@ async function loadKey(
   key: Uint8Array,
   keySha256: string,
   exportRaw: boolean,
-): Promise<{ key: string; inputs: number; outputs: number; raw?: Uint8Array }> {
+  keyBytes = key.byteLength,
+): Promise<{ key: string; inputs: number; outputs: number; raw?: Uint8Array; loadedKeys: string[] }> {
   const module = requireRuntime();
-  // One key at a time: its points are most of the wasm heap.
-  loaded?.prover.free();
+  // Budget conservatively for decoded points, solver and GPU state. This is
+  // admission accounting, not a measurement of allocator/GPU memory. The 1 GiB
+  // ceiling leaves room in wasm32 for transient decoding and proof buffers.
+  let estimatedBytes = Math.max(keyBytes * 8, key.byteLength * 3);
+  evict(fileName);
+  makeRoom(estimatedBytes);
   loaded = undefined;
   let prover: SprProver;
   if (pooled || isRawKey(key)) {
@@ -134,11 +171,20 @@ async function loadKey(
     prover.free();
     throw new WasmProverError("wasm_key_digest_mismatch");
   }
-  loaded = { fileName, prover };
-  const info = { key: prover.name(), inputs: prover.inputs(), outputs: prover.outputs() };
-  if (!exportRaw) return info;
-  const raw = prover.export_raw();
-  return raw.byteLength === 0 ? info : { ...info, raw };
+  try {
+    const info = { key: prover.name(), inputs: prover.inputs(), outputs: prover.outputs() };
+    // Drain temporary source state for retained keys, even without disk caching.
+    const raw = exportRaw || residentBudget > 0 ? prover.export_raw() : new Uint8Array();
+    estimatedBytes = Math.max(estimatedBytes, raw.byteLength * 3);
+    makeRoom(estimatedBytes);
+    loaded = { fileName, prover, estimatedBytes };
+    residents.set(fileName, loaded);
+    return { ...info, loadedKeys: [...residents.keys()],
+      ...(exportRaw && raw.byteLength > 0 ? { raw } : {}) };
+  } catch (error) {
+    prover.free();
+    throw error;
+  }
 }
 
 async function prove(body: string): Promise<ProofValue & { backend: "gpu" | "cpu" }> {
@@ -166,7 +212,7 @@ async function prove(body: string): Promise<ProofValue & { backend: "gpu" | "cpu
 async function handle(request: WorkerRequest): Promise<unknown> {
   switch (request.kind) {
     case "init":
-      await init(request.threads, request.gpu);
+      await init(request.threads, request.gpu, request.residentKeyBudgetBytes);
       return {
         initialized: true,
         threads: activeThreads,
@@ -179,11 +225,15 @@ async function handle(request: WorkerRequest): Promise<unknown> {
         new Uint8Array(request.key),
         request.keySha256,
         request.exportRaw,
+        request.keyBytes,
       );
+    case "selectKey":
+      selectKey(request.fileName, request.keySha256);
+      return { keys: [...residents.keys()] };
     case "prove":
       return await prove(request.body);
     case "loadedKeys":
-      return { keys: loaded === undefined ? [] : [loaded.fileName] };
+      return { keys: [...residents.keys()] };
   }
 }
 

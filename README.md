@@ -13,6 +13,7 @@ See the [Node guide](packages/web-prover/README.md#nodejs).
 - [`@heliuslabs/spr-web-prover`](packages/web-prover/README.md) — worker, keys, local prove/verify, and a `fetch` shim for the protocol SDK. Matches `@heliuslabs/spr` 0.9.0-alpha (merges of up to 24 notes).
 - [`examples/wallet`](examples/wallet/README.md) — private wallet on devnet-e (register, shield, send, unshield); start here for an end-to-end flow.
 - `examples/browser` — synthetic-request benchmark and timing harness.
+- [Minimal Node TypeScript example](examples/node) — preload a key and prove locally.
 
 The protocol pin is **v0.8.0-alpha**,
 `c4062d3860965855e47268f61b01a27e774096eb`. Applications supply their RPC,
