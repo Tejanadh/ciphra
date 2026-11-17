@@ -15,7 +15,7 @@ import { abortable } from "./abortable.js";
 import type { KeyProgress, Measurement } from "./measurement.js";
 import { WasmProverError, workerError } from "./errors.js";
 export { WasmProverError } from "./errors.js";
-import { KeyStore, type KeyBytes, type KeyDigest, type ProvingKeyStatus } from "./key-store.js";
+import { KeyStore, type KeyBytes, type KeyDigest, type ProvingKeyStatus, type KeyCacheStorage } from "./key-store.js";
 import { automaticProvingThreads } from "./proving-threads.js";
 import { createProverFetch } from "./prover-fetch.js";
 import type { ProvingKeyCatalog, ProvingKeySource } from "./key-catalog.js";
@@ -24,7 +24,7 @@ import { type ShapeKey } from "./shapes.js";
 
 /** Messages the worker understands. Mirrored by `prover.worker.ts`. */
 export type WorkerRequest =
-  | Readonly<{ id: number; kind: "init"; threads: number }>
+  | Readonly<{ id: number; kind: "init"; threads: number; gpu?: "auto" | "off" | "required"; residentKeyBudgetBytes?: number }>
   | Readonly<{
       id: number;
       kind: "loadKey";
@@ -35,7 +35,10 @@ export type WorkerRequest =
       keySha256: string;
       /** Ask for the raw form back, to cache. */
       exportRaw: boolean;
+      /** Pinned compressed size, for conservative resident-cache accounting. */
+      keyBytes?: number;
     }>
+  | Readonly<{ id: number; kind: "selectKey"; fileName: string; keySha256: string }>
   | Readonly<{ id: number; kind: "prove"; body: string }>
   | Readonly<{ id: number; kind: "loadedKeys" }>;
 
@@ -44,6 +47,14 @@ export type WorkerRequest =
  * every request's payload. Distribute it so each member keeps its own fields.
  */
 type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
+
+/** The message surface shared by browser workers and Node worker threads. */
+export interface ProverWorker {
+  addEventListener(type: "message", listener: (event: MessageEvent) => void): void;
+  addEventListener(type: "error" | "messageerror", listener: (event: Event) => void): void;
+  postMessage(message: unknown, transfer: ArrayBuffer[]): void;
+  terminate(): void;
+}
 
 export type WorkerFatal = Readonly<{ fatal: true; error: string }>;
 
@@ -58,6 +69,16 @@ export type WorkerResponse = Readonly<{
 }>;
 
 export interface WasmProverOptions {
+  /**
+   * Opt-in LRU cache of loaded provers. 0 (default) keeps one shape.
+   * Estimated key-state budget, at most 1 GiB; not a process/GPU memory limit.
+   * Oversized keys run alone. Leave additional memory for decoding and proofs.
+   */
+  readonly residentKeyBudgetBytes?: number;
+  /** GPU acceleration when available (default), CPU only, or fail if unavailable. */
+  readonly gpu?: "auto" | "off" | "required";
+  /** Override persistent key storage. Node uses a disk cache. */
+  readonly cacheStorage?: KeyCacheStorage;
   /**
    * Threads of the proving pool (one or more; omit to choose automatically), or
    * `0` for the single-thread runtime without SharedArrayBuffer.
@@ -83,7 +104,7 @@ export interface WasmProverOptions {
   readonly proverUrl: string;
   readonly fetch?: typeof globalThis.fetch;
   /** Override worker construction for tests or a custom bundler. */
-  readonly workerFactory?: () => Worker;
+  readonly workerFactory?: () => ProverWorker;
   /** Called for each timed worker operation so the UI can chart it. */
   readonly onMeasurement?: (measurement: Measurement) => void;
   /** Called as each proving key downloads and when the worker starts decoding it. */
@@ -100,8 +121,8 @@ export interface WasmProverOptions {
  * and the SDK's `fetch` comes from `createProverFetch`.
  */
 export class WasmProver {
-  #worker: Worker | undefined;
-  #factory: (() => Worker) | undefined;
+  #worker: ProverWorker | undefined;
+  #factory: (() => ProverWorker) | undefined;
   #initialization: Promise<void> | undefined;
   #lifetime = new AbortController();
   /** The encoding of the raw keys the started worker's runtime exports and accepts. */
@@ -109,6 +130,11 @@ export class WasmProver {
   #nextId = 1;
   #queue: Promise<unknown> = Promise.resolve();
   #threads = 0;
+  #gpuAvailable = false;
+  /** Whether initialization found a GPU; each proof reports its actual backend. */
+  get gpuAvailable(): boolean {
+    return this.#gpuAvailable;
+  }
   get threads(): number {
     return this.#threads;
   }
@@ -137,18 +163,22 @@ export class WasmProver {
     number,
     Readonly<{ resolve: (value: WorkerResponse) => void; reject: (error: unknown) => void }>
   >();
-  /** The key the worker holds; one deserialized key is resident at a time. */
+  /** Resident keys reported by the worker after a load or selection. */
   readonly #loaded = new Set<string>();
   readonly #options: WasmProverOptions;
   readonly #store: KeyStore;
   readonly #fetch: typeof globalThis.fetch;
 
   constructor(options: WasmProverOptions) {
+    const budget = options.residentKeyBudgetBytes ?? 0;
+    if (!Number.isSafeInteger(budget) || budget < 0 || budget > 1024 ** 3)
+      throw new RangeError("residentKeyBudgetBytes must be an integer between 0 and 1 GiB");
     this.#options = options;
     this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.#factory = options.workerFactory ?? createProverWorker;
     this.#store = new KeyStore({
       fetch: this.#fetch,
+      ...(options.cacheStorage === undefined ? {} : { cacheStorage: options.cacheStorage }),
       ...(options.keyBaseUrl === undefined ? {} : { keyBaseUrl: options.keyBaseUrl }),
       ...(options.keyCatalog === undefined ? {} : { keyCatalog: options.keyCatalog }),
       ...(options.keySource === undefined ? {} : { keySource: options.keySource }),
@@ -162,13 +192,13 @@ export class WasmProver {
    * The runtime must run in a worker: a proof blocks its thread for seconds,
    * so on the main thread it would freeze the page for the whole proof.
    */
-  start(source: Worker | (() => Worker) | undefined = this.#factory): Promise<void> {
+  start(source: ProverWorker | (() => ProverWorker) | undefined = this.#factory): Promise<void> {
     if (this.#initialization !== undefined) return this.#initialization;
     if (source === undefined) {
       return Promise.reject(new WasmProverError("wasm_worker_not_started"));
     }
     this.#factory = typeof source === "function" ? source : undefined;
-    let worker: Worker;
+    let worker: ProverWorker;
     try {
       worker = typeof source === "function" ? source() : source;
     } catch {
@@ -198,6 +228,10 @@ export class WasmProver {
     const initialization = this.#call({
       kind: "init",
       threads: this.#options.threads ?? automaticProvingThreads(),
+      ...(this.#options.gpu === undefined ? {} : { gpu: this.#options.gpu }),
+      ...(this.#options.residentKeyBudgetBytes === undefined ? {} : {
+        residentKeyBudgetBytes: this.#options.residentKeyBudgetBytes,
+      }),
     })
       .then((ready) => {
         if (this.#worker !== worker) throw new WasmProverError("wasm_worker_terminated");
@@ -213,6 +247,7 @@ export class WasmProver {
           throw new WasmProverError("wasm_invalid_response");
         }
         this.#threads = value.threads;
+        this.#gpuAvailable = "gpuAvailable" in value && value.gpuAvailable === true;
         this.#rawKeyFormat = value.rawKeyFormat;
       })
       .catch((error: unknown) => {
@@ -247,7 +282,7 @@ export class WasmProver {
    * shapes already kept are skipped. Each shape is queued on its own, so a proof
    * requested meanwhile runs after the shape in progress. Aborting skips the
    * remaining shapes; aborting the one in progress restarts the worker. Without
-   * the Cache API only the last shape stays loaded.
+   * the Cache API decoded forms are not persisted; the resident budget still applies.
    */
   async prefetch(
     options: Readonly<{
@@ -276,8 +311,7 @@ export class WasmProver {
 
   /**
    * Removes the kept keys, their decoded forms and interrupted downloads. A
-   * prefetch or proof in progress finishes first; the key the worker has loaded
-   * stays loaded.
+   * prefetch or proof in progress finishes first; resident keys stay loaded.
    */
   async clearKeys(signal?: AbortSignal): Promise<void> {
     await this.#enqueue((active) => this.#store.clear(active), signal);
@@ -291,6 +325,10 @@ export class WasmProver {
     await this.#ensureStarted(signal);
     const expected = this.#store.digest(shape);
     if (this.#loaded.has(shape.keyFile)) {
+      // Selecting also updates the worker's LRU order. A cache hit must change
+      // the active prover before the next proof, not merely skip the key fetch.
+      if ((this.#options.residentKeyBudgetBytes ?? 0) > 0)
+        await this.#call({ kind: "selectKey", fileName: shape.keyFile, keySha256: expected.keySha256 });
       // Reported rather than returned silently: a second sweep would otherwise
       // show a passing run with no steps, which reads as a lost measurement.
       this.#options.onMeasurement?.({
@@ -337,7 +375,7 @@ export class WasmProver {
     }
     signal.throwIfAborted();
     const info = response.value as
-      | Readonly<{ key?: string; inputs?: number; outputs?: number; raw?: unknown }>
+      | Readonly<{ key?: string; inputs?: number; outputs?: number; raw?: unknown; loadedKeys?: readonly string[] }>
       | undefined;
     this.#options.onMeasurement?.({
       step: "key-load",
@@ -358,7 +396,7 @@ export class WasmProver {
         signal,
       );
     this.#loaded.clear();
-    this.#loaded.add(shape.keyFile);
+    for (const keyFile of info?.loadedKeys ?? [shape.keyFile]) this.#loaded.add(keyFile);
   }
 
   #installKey(shape: ShapeKey, key: KeyBytes, expected: KeyDigest): Promise<WorkerResponse> {
@@ -370,6 +408,7 @@ export class WasmProver {
         keySha256: expected.keySha256,
         // The runtime's raw form, to keep in place of the pinned file.
         exportRaw: !key.raw && key.cacheable,
+        keyBytes: expected.size,
       },
       [key.bytes],
     );
@@ -400,7 +439,7 @@ export class WasmProver {
   async proveRequest(
     body: string,
     signal?: AbortSignal,
-  ): Promise<{ proof: string; proveMs: number; verifyMs: number }> {
+  ): Promise<{ proof: string; proveMs: number; verifyMs: number; backend?: "gpu" | "cpu" }> {
     return this.#enqueue(async (active) => {
       const shape = proofRequestShape(body);
       if (shape === undefined) {
@@ -429,7 +468,11 @@ export class WasmProver {
             ? "zopro proof, single thread; locally verified"
             : `zopro proof, ${String(this.#threads)} threads; locally verified`,
       });
-      return { proof: value.proof, proveMs: response.ms - value.verifyMs, verifyMs: value.verifyMs };
+      return {
+        proof: value.proof, proveMs: response.ms - value.verifyMs, verifyMs: value.verifyMs,
+        ...("backend" in value && (value.backend === "gpu" || value.backend === "cpu")
+          ? { backend: value.backend } : {}),
+      };
     }, signal);
   }
 
@@ -456,6 +499,7 @@ export class WasmProver {
   }
 
   #fail(error: unknown): void {
+    this.#gpuAvailable = false;
     this.#worker?.terminate();
     this.#worker = undefined;
     this.#initialization = undefined;
@@ -471,7 +515,7 @@ export class WasmProver {
 
   async #call(
     request: WithoutId<WorkerRequest>,
-    transfer: readonly Transferable[] = [],
+    transfer: readonly ArrayBuffer[] = [],
   ): Promise<WorkerResponse> {
     const worker = this.#worker;
     if (worker === undefined) {

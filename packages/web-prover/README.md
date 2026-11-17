@@ -8,6 +8,42 @@ Local Groth16 proving in a browser worker. No protocol SDK or Solana dependencie
 npm install @heliuslabs/spr-web-prover
 ```
 
+## Node.js
+
+Node 24+ uses worker threads and the same WASM runtime. Install the optional
+`webgpu` peer for GPU acceleration:
+
+```sh
+npm install @heliuslabs/spr-web-prover webgpu
+```
+
+See the [runnable TypeScript example](../../examples/node) for preloading a key,
+proving a request and releasing the worker.
+
+- `gpu`: `"auto"` (default), `"off"`, or `"required"` to reject startup without a GPU.
+  Each result's `backend` reports actual execution, including CPU recovery after
+  a GPU failure.
+- `threads`: defaults to available processors, capped at 18; `0` uses single-thread WASM.
+- `cacheDir`: defaults to `~/.cache/spr-prover`; `false` disables disk caching.
+  Only public proving keys are persisted.
+- `residentKeyBudgetBytes`: defaults to `0` (one loaded shape). Set, for example,
+  `512 * 1024 ** 2` to retain multiple shapes with LRU eviction in one worker.
+
+Use `prefetch({ shapes })` to prepare the disk cache, or `ensureKey(shape)` to
+make a shape resident. Keep the instance alive between proofs and call
+`terminate()` when finished. `loadedKeys()` lists resident shapes.
+
+The resident budget estimates key state using the larger of 8× compressed bytes
+and 3× decoded bytes, when available. It is capped at 1 GiB; proof buffers,
+workers and GPU allocations need additional memory. Keys exceeding the budget
+run alone. Cancellation of active work clears resident state; disk entries survive.
+
+Benchmarks: [all 40 shapes](../../benchmarks/node/2026-11-17-m5-pro.md) and
+[alternating shapes](../../benchmarks/node/2026-11-17-switching.md), with raw
+samples and reproduction commands.
+
+## Browser
+
 Use a bundler that emits `new URL(..., import.meta.url)` assets and nested module workers (Vite and webpack 5 work; plain esbuild/Rollup usually do not). Keys load from the Zolana key CDN on first use and are checked against digests shipped in the package.
 
 ## Isolation and threads
@@ -170,7 +206,7 @@ await prover.prefetch({
 
 ## Lifecycle
 
-- The worker starts on first use. Work is serialized; one key is loaded at a time.
+- The worker starts on first use. Work is serialized; loaded shapes follow the resident-key budget (one by default).
 - `AbortSignal` cancels queued work; cancelling in-flight work tears down the runtime (it can restart via the retained factory).
 - `terminate()` stops the worker and disables auto-restart.
 - Failures surface as `WasmProverError` with a stable `code` (no witness or backend detail in the message).

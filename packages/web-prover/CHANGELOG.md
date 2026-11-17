@@ -2,6 +2,10 @@
 
 ## 0.7.0-alpha — unreleased
 
+- Add `SprNodeProver` through the `/node` entry for Node 24+, with worker threads, persistent public-key caching and optional Dawn WebGPU acceleration.
+- Add opt-in `residentKeyBudgetBytes` to retain multiple loaded shapes with LRU eviction, sharing one worker and thread pool. The default still retains one shape.
+- Add a minimal Node TypeScript example and reproducible per-shape and alternating-shape benchmarks.
+
 - Breaking: the package is published as `@heliuslabs/spr-web-prover`, and `ZolanaWebProver` and the `zolana-prover-keys` command become `SprWebProver` and `spr-prover-keys`. Replace the dependency, imports and install scripts; key caches are kept.
 - `keySource` accepts the authenticated runtime key set from `@heliuslabs/spr` 0.9.0-alpha's `fetchProvingKeySet()`, including new download URLs, sizes and checksums, for compatible transfer and merge circuits.
 - Runtime key sets stay fixed per prover instance and use separate caches; clear obsolete instances with `clearKeys()`.

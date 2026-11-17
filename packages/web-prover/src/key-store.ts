@@ -51,7 +51,20 @@ export type KeyBytes = Readonly<{
   cacheable: boolean;
 }>;
 
+/** Storage operations used by the key cache; Node supplies a disk implementation. */
+export interface KeyCache {
+  match(url: string): Promise<Response | undefined>;
+  put(url: string, response: Response): Promise<void>;
+  delete(url: string): Promise<boolean>;
+}
+export interface KeyCacheStorage {
+  open(name: string): Promise<KeyCache>;
+  keys(): Promise<string[]>;
+  delete(name: string): Promise<boolean>;
+}
+
 export interface KeyStoreOptions {
+  readonly cacheStorage?: KeyCacheStorage;
   /** Where keys are fetched from; the pinned key set on the Zolana CDN by default. */
   readonly keyBaseUrl?: string;
   /** Download URLs from /proving-keys, checked against the bundled pins. */
@@ -68,7 +81,7 @@ export class KeyStore {
   readonly #sourceKeys: ReturnType<typeof sourceKeys>["keys"] | undefined;
   readonly #cacheName: string;
   #prepared = false;
-  #cache: Cache | undefined;
+  #cache: KeyCache | undefined;
 
   constructor(options: KeyStoreOptions) {
     this.#options = options;
@@ -131,7 +144,7 @@ export class KeyStore {
   /** Removes the kept keys, their raw forms and interrupted downloads. */
   async clear(signal: AbortSignal): Promise<void> {
     this.#cache = undefined;
-    await optionalCache(() => globalThis.caches?.delete(this.#cacheName), signal);
+    await optionalCache(() => (this.#options.cacheStorage ?? globalThis.caches)?.delete(this.#cacheName), signal);
   }
 
   /** Whether the store keeps this shape's raw form, written by a runtime of `rawKeyFormat`. */
@@ -209,21 +222,21 @@ export class KeyStore {
    * of other key sets, so a rotation frees its keys at once, and asks for
    * persistence when the caller opted in.
    */
-  async #open(signal: AbortSignal): Promise<Cache | undefined> {
+  async #open(signal: AbortSignal): Promise<KeyCache | undefined> {
     if (this.#cache !== undefined) return this.#cache;
     if (!this.#prepared) {
       this.#prepared = true;
       // Another live prover may still be using an earlier runtime generation.
       const names = this.#sourceKeys === undefined
-        ? await optionalCache(() => globalThis.caches?.keys(), signal) : [];
+        ? await optionalCache(() => (this.#options.cacheStorage ?? globalThis.caches)?.keys(), signal) : [];
       for (const name of names ?? []) {
         if (name.startsWith(keyCachePrefix) && name !== this.#cacheName)
-          await optionalCache(() => globalThis.caches?.delete(name), signal);
+          await optionalCache(() => (this.#options.cacheStorage ?? globalThis.caches)?.delete(name), signal);
       }
       if (this.#options.persistStorage === true)
         await optionalCache(() => globalThis.navigator?.storage?.persist(), signal);
     }
-    this.#cache = await optionalCache(() => globalThis.caches?.open(this.#cacheName), signal);
+    this.#cache = await optionalCache(() => (this.#options.cacheStorage ?? globalThis.caches)?.open(this.#cacheName), signal);
     return this.#cache;
   }
 
@@ -234,7 +247,7 @@ export class KeyStore {
    * is rebuilt from the pinned key, and a proof is verified before it returns.
    */
   async #cachedRaw(
-    cache: Cache | undefined,
+    cache: KeyCache | undefined,
     url: string,
     expected: KeyDigest,
     rawKeyFormat: string,
@@ -258,7 +271,7 @@ export class KeyStore {
   }
 
   async #pinned(
-    cache: Cache | undefined,
+    cache: KeyCache | undefined,
     url: string,
     expected: KeyDigest,
     signal: AbortSignal,
@@ -321,7 +334,7 @@ export class KeyStore {
    * kept parts.
    */
   async #downloadInParts(
-    cache: Cache,
+    cache: KeyCache,
     url: string,
     size: number,
     signal: AbortSignal,
@@ -434,7 +447,7 @@ function partUrl(url: string, index: number): string {
  * How many bytes of a download of `size` bytes the cache keeps in parts. The
  * first part goes alone, so a download that kept any kept that one.
  */
-async function keptBytes(cache: Cache, url: string, size: number, signal: AbortSignal): Promise<number> {
+async function keptBytes(cache: KeyCache, url: string, size: number, signal: AbortSignal): Promise<number> {
   let kept = 0;
   for (let index = 0; index * keyPartBytes < size; index++) {
     if ((await optionalCache(() => cache.match(partUrl(url, index)), signal)) !== undefined)
@@ -444,7 +457,7 @@ async function keptBytes(cache: Cache, url: string, size: number, signal: AbortS
   return kept;
 }
 
-async function deleteParts(cache: Cache, url: string, size: number, signal: AbortSignal): Promise<void> {
+async function deleteParts(cache: KeyCache, url: string, size: number, signal: AbortSignal): Promise<void> {
   for (let index = 0; index * keyPartBytes < size; index++)
     await optionalCache(() => cache.delete(partUrl(url, index)), signal);
 }

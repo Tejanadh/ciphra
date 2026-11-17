@@ -2,6 +2,10 @@
 
 Local Groth16 proving for Solana Privacy Rings in the browser: [`@heliuslabs/spr-web-prover`](packages/web-prover/README.md), a [wallet example](examples/wallet/README.md) that proves every transaction in the page, and a [prover benchmark](examples/browser).
 
+Also runs in **Node.js 24+** through `@heliuslabs/spr-web-prover/node`, with
+multithreaded WASM, optional WebGPU acceleration, and a persistent key cache.
+See the [Node guide](packages/web-prover/README.md#nodejs).
+
 **Performance.** In Chrome at four threads on an Apple M5 Pro with WebGPU, a warm proof takes about 0.06–0.43 s for 1–24 notes (0.08 s for 2×2). CPU-only is slower (0.28 s for 2×2, 2.6 s for 24×2). The first load of a shape adds key download and decode; later loads use a cached raw form (tens of milliseconds).
 
 ## Packages
@@ -9,6 +13,7 @@ Local Groth16 proving for Solana Privacy Rings in the browser: [`@heliuslabs/spr
 - [`@heliuslabs/spr-web-prover`](packages/web-prover/README.md) — worker, keys, local prove/verify, and a `fetch` shim for the protocol SDK. Matches `@heliuslabs/spr` 0.9.0-alpha (merges of up to 24 notes).
 - [`examples/wallet`](examples/wallet/README.md) — private wallet on devnet-e (register, shield, send, unshield); start here for an end-to-end flow.
 - `examples/browser` — synthetic-request benchmark and timing harness.
+- [Minimal Node TypeScript example](examples/node) — preload a key and prove locally.
 
 The protocol pin is **v0.8.0-alpha**,
 `c4062d3860965855e47268f61b01a27e774096eb`. Applications supply their RPC,
@@ -42,6 +47,19 @@ npm run typecheck
 npm run check        # unit tests and builds
 npm run check:full   # also browser + packed-consumer gates
 ```
+
+Node checks and benchmarks (build the prover first):
+
+```sh
+npm run test:node
+SPR_TEST_GPU=1 npm run test:node  # require GPU proofs too
+npm run bench:node
+```
+
+The benchmark covers all supported shapes on CPU and GPU. Set
+`SPR_BENCH_MODES=cpu:4` for CPU only, `SPR_BENCH_SHAPES=2x2,8x2` for a subset,
+and `SPR_BENCH_OUTPUT=timing.json` to choose the output file.
+See [per-shape results and methodology](benchmarks/node/2026-11-17-m5-pro.md).
 
 Devnet e2e (funded key, keyed RPC):
 

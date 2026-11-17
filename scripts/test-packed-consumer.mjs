@@ -50,10 +50,12 @@ try {
   const installed = join(consumer, "node_modules/@heliuslabs/spr-web-prover");
   assert.equal((await lstat(installed)).isSymbolicLink(), false);
   const manifest = JSON.parse(await readFile(join(installed, "package.json"), "utf8"));
-  for (const field of ["dependencies", "peerDependencies", "optionalDependencies"]) {
+  for (const field of ["dependencies", "optionalDependencies"]) {
     assert.deepEqual(Object.keys(manifest[field] || {}), [], `Unexpected ${field}`);
   }
-  for (const dependency of ["@heliuslabs/spr", "@solana/kit"]) {
+  assert.deepEqual(manifest.peerDependencies, { webgpu: "^0.6.2" });
+  assert.deepEqual(manifest.peerDependenciesMeta, { webgpu: { optional: true } });
+  for (const dependency of ["@heliuslabs/spr", "@solana/kit", "webgpu"]) {
     await assert.rejects(lstat(join(consumer, "node_modules", dependency)), { code: "ENOENT" });
   }
   await command(join(consumer, "node_modules/.bin/tsc"), ["-p", "tsconfig.json"], consumer);

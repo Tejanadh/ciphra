@@ -39,3 +39,17 @@ Source mapping:
 - `poc/web` -> `examples/browser` (same branch and commit)
 
 `fixtures/` holds valid requests for each benchmarked shape on trees of their own, from zk-tools' `zopro/tools/zolana/fixtures` at the runtime's revision: zolana's request and merge fixtures with the shape changed.
+
+`fixtures/node-shapes.json.gz` contains synthetic requests for all supported
+shapes. Transfers are generated and constraint-checked at the revision in
+`key-catalog-source.json`; merges come from the revision in `runtime.lock.json`.
+Regenerate with Go 1.27 and local checkouts (the protocol must be clean and at
+its pinned revision):
+
+```sh
+python3 scripts/generate-node-fixtures.py \
+  --protocol-source /path/to/privacy-rings \
+  --runtime-source /path/to/zk-tools
+```
+
+The generator creates a temporary Go test and removes it afterward.

@@ -27,6 +27,8 @@ jobs:
       - run: npm ci
       - run: npm run setup
       - run: npm run check
+      - run: npm run test:node
+        timeout-minutes: 10
       - run: npm run test:browser
         env:
           CHROME_NO_SANDBOX: "1"
