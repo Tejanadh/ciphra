@@ -68,6 +68,10 @@ verified proofs; download, key preparation and worker startup excluded):
 These are local proving measurements on one host, not network transaction
 latencies or a guarantee for other hardware. Run `npm run bench:node` in this
 repository to measure your host, including first-use costs separately.
+With an empty cache on the same host, the first 24×2 proof took 9.4 s:
+2.2 s downloading 145 MB and 6.5 s preparing the key. A new worker with the
+decoded key cached took about 0.85 s including startup and its first proof.
+Use `prefetch()` during application startup to move preparation ahead of a spend.
 
 ## Browser
 
