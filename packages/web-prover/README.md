@@ -8,6 +8,69 @@ Local Groth16 proving in a browser worker. No protocol SDK or Solana dependencie
 npm install @heliuslabs/spr-web-prover
 ```
 
+## Node.js
+
+Node 24+ can prove locally without a browser or bundler. Import the Node entry;
+it runs the same WASM engine in worker threads, including its Rayon pool.
+Install `webgpu` to enable GPU acceleration through Dawn (Metal, Vulkan or
+Direct3D, depending on the host and drivers):
+
+```sh
+npm install @heliuslabs/spr-web-prover webgpu
+```
+
+```ts
+import { SprNodeProver } from "@heliuslabs/spr-web-prover/node";
+
+const prover = new SprNodeProver({
+  proverUrl: "http://127.0.0.1:3001",
+  threads: 4,
+  gpu: "auto",
+});
+try {
+  const result = await prover.proveRequest(requestJson);
+  console.log(result.backend, result.proveMs, result.verifyMs);
+} finally {
+  prover.terminate();
+}
+```
+
+`gpu: "auto"` uses the GPU when available and multithreaded CPU otherwise.
+`gpu: "required"` rejects initialization if no GPU is available; `"off"` disables
+it. `gpuAvailable` reports initialization capability, while each proof's
+`backend` reports actual execution, including a CPU retry after a GPU failure.
+Every returned proof is verified. `threads: 0` selects the single-thread WASM
+runtime; key decompression can still use auxiliary workers.
+
+The default pool uses available processors, capped at 18. More threads are not
+always faster, especially with a GPU; benchmark your request shapes and host.
+The Node entry caches validated downloads and decoded keys in
+`~/.cache/spr-prover`. Set `cacheDir` to another directory or `false` to disable
+disk caching. Reusing an instance keeps the current shape resident; `prefetch`
+prepares other shapes in the disk cache. Only public proving keys are persisted,
+never requests or witnesses. No globals are installed in your application's thread.
+
+`createFetch()`, cancellation, runtime key sources, and the protocol SDK
+integration below work in Node too. Call `terminate()` when finished to release
+the prover, GPU and nested workers. The `webgpu` peer is optional and is not
+installed for browser-only consumers.
+
+Measured on an Apple M5 Pro, Node 24.21.0 (median of three warm, locally
+verified proofs; download, key preparation and worker startup excluded):
+
+| Circuit | Single CPU thread | 18 CPU threads | GPU + 18 threads |
+| --- | ---: | ---: | ---: |
+| Transfer 2×2 | 1,080 ms | 128 ms | 70 ms |
+| Transfer 16×2 | 7,404 ms | 676 ms | 251 ms |
+| Transfer 24×2 | 12,518 ms | 1,116 ms | 369 ms |
+| Merge 24×1 | 12,294 ms | 1,079 ms | 366 ms |
+
+These are local proving measurements on one host, not network transaction
+latencies or a guarantee for other hardware. Run `npm run bench:node` in this
+repository to measure your host, including first-use costs separately.
+
+## Browser
+
 Use a bundler that emits `new URL(..., import.meta.url)` assets and nested module workers (Vite and webpack 5 work; plain esbuild/Rollup usually do not). Keys load from the Zolana key CDN on first use and are checked against digests shipped in the package.
 
 ## Isolation and threads

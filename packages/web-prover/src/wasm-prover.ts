@@ -15,7 +15,7 @@ import { abortable } from "./abortable.js";
 import type { KeyProgress, Measurement } from "./measurement.js";
 import { WasmProverError, workerError } from "./errors.js";
 export { WasmProverError } from "./errors.js";
-import { KeyStore, type KeyBytes, type KeyDigest, type ProvingKeyStatus } from "./key-store.js";
+import { KeyStore, type KeyBytes, type KeyDigest, type ProvingKeyStatus, type KeyCacheStorage } from "./key-store.js";
 import { automaticProvingThreads } from "./proving-threads.js";
 import { createProverFetch } from "./prover-fetch.js";
 import type { ProvingKeyCatalog, ProvingKeySource } from "./key-catalog.js";
@@ -24,7 +24,7 @@ import { type ShapeKey } from "./shapes.js";
 
 /** Messages the worker understands. Mirrored by `prover.worker.ts`. */
 export type WorkerRequest =
-  | Readonly<{ id: number; kind: "init"; threads: number }>
+  | Readonly<{ id: number; kind: "init"; threads: number; gpu?: "auto" | "off" | "required" }>
   | Readonly<{
       id: number;
       kind: "loadKey";
@@ -45,6 +45,14 @@ export type WorkerRequest =
  */
 type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
 
+/** The message surface shared by browser workers and Node worker threads. */
+export interface ProverWorker {
+  addEventListener(type: "message", listener: (event: MessageEvent) => void): void;
+  addEventListener(type: "error" | "messageerror", listener: (event: Event) => void): void;
+  postMessage(message: unknown, transfer: ArrayBuffer[]): void;
+  terminate(): void;
+}
+
 export type WorkerFatal = Readonly<{ fatal: true; error: string }>;
 
 export type WorkerResponse = Readonly<{
@@ -58,6 +66,10 @@ export type WorkerResponse = Readonly<{
 }>;
 
 export interface WasmProverOptions {
+  /** GPU acceleration when available (default), CPU only, or fail if unavailable. */
+  readonly gpu?: "auto" | "off" | "required";
+  /** Override persistent key storage. Node uses a disk cache. */
+  readonly cacheStorage?: KeyCacheStorage;
   /**
    * Threads of the proving pool (one or more; omit to choose automatically), or
    * `0` for the single-thread runtime without SharedArrayBuffer.
@@ -83,7 +95,7 @@ export interface WasmProverOptions {
   readonly proverUrl: string;
   readonly fetch?: typeof globalThis.fetch;
   /** Override worker construction for tests or a custom bundler. */
-  readonly workerFactory?: () => Worker;
+  readonly workerFactory?: () => ProverWorker;
   /** Called for each timed worker operation so the UI can chart it. */
   readonly onMeasurement?: (measurement: Measurement) => void;
   /** Called as each proving key downloads and when the worker starts decoding it. */
@@ -100,8 +112,8 @@ export interface WasmProverOptions {
  * and the SDK's `fetch` comes from `createProverFetch`.
  */
 export class WasmProver {
-  #worker: Worker | undefined;
-  #factory: (() => Worker) | undefined;
+  #worker: ProverWorker | undefined;
+  #factory: (() => ProverWorker) | undefined;
   #initialization: Promise<void> | undefined;
   #lifetime = new AbortController();
   /** The encoding of the raw keys the started worker's runtime exports and accepts. */
@@ -109,6 +121,11 @@ export class WasmProver {
   #nextId = 1;
   #queue: Promise<unknown> = Promise.resolve();
   #threads = 0;
+  #gpuAvailable = false;
+  /** Whether initialization found a GPU; each proof reports its actual backend. */
+  get gpuAvailable(): boolean {
+    return this.#gpuAvailable;
+  }
   get threads(): number {
     return this.#threads;
   }
@@ -149,6 +166,7 @@ export class WasmProver {
     this.#factory = options.workerFactory ?? createProverWorker;
     this.#store = new KeyStore({
       fetch: this.#fetch,
+      ...(options.cacheStorage === undefined ? {} : { cacheStorage: options.cacheStorage }),
       ...(options.keyBaseUrl === undefined ? {} : { keyBaseUrl: options.keyBaseUrl }),
       ...(options.keyCatalog === undefined ? {} : { keyCatalog: options.keyCatalog }),
       ...(options.keySource === undefined ? {} : { keySource: options.keySource }),
@@ -162,13 +180,13 @@ export class WasmProver {
    * The runtime must run in a worker: a proof blocks its thread for seconds,
    * so on the main thread it would freeze the page for the whole proof.
    */
-  start(source: Worker | (() => Worker) | undefined = this.#factory): Promise<void> {
+  start(source: ProverWorker | (() => ProverWorker) | undefined = this.#factory): Promise<void> {
     if (this.#initialization !== undefined) return this.#initialization;
     if (source === undefined) {
       return Promise.reject(new WasmProverError("wasm_worker_not_started"));
     }
     this.#factory = typeof source === "function" ? source : undefined;
-    let worker: Worker;
+    let worker: ProverWorker;
     try {
       worker = typeof source === "function" ? source() : source;
     } catch {
@@ -198,6 +216,7 @@ export class WasmProver {
     const initialization = this.#call({
       kind: "init",
       threads: this.#options.threads ?? automaticProvingThreads(),
+      ...(this.#options.gpu === undefined ? {} : { gpu: this.#options.gpu }),
     })
       .then((ready) => {
         if (this.#worker !== worker) throw new WasmProverError("wasm_worker_terminated");
@@ -213,6 +232,7 @@ export class WasmProver {
           throw new WasmProverError("wasm_invalid_response");
         }
         this.#threads = value.threads;
+        this.#gpuAvailable = "gpuAvailable" in value && value.gpuAvailable === true;
         this.#rawKeyFormat = value.rawKeyFormat;
       })
       .catch((error: unknown) => {
@@ -400,7 +420,7 @@ export class WasmProver {
   async proveRequest(
     body: string,
     signal?: AbortSignal,
-  ): Promise<{ proof: string; proveMs: number; verifyMs: number }> {
+  ): Promise<{ proof: string; proveMs: number; verifyMs: number; backend?: "gpu" | "cpu" }> {
     return this.#enqueue(async (active) => {
       const shape = proofRequestShape(body);
       if (shape === undefined) {
@@ -429,7 +449,11 @@ export class WasmProver {
             ? "zopro proof, single thread; locally verified"
             : `zopro proof, ${String(this.#threads)} threads; locally verified`,
       });
-      return { proof: value.proof, proveMs: response.ms - value.verifyMs, verifyMs: value.verifyMs };
+      return {
+        proof: value.proof, proveMs: response.ms - value.verifyMs, verifyMs: value.verifyMs,
+        ...("backend" in value && (value.backend === "gpu" || value.backend === "cpu")
+          ? { backend: value.backend } : {}),
+      };
     }, signal);
   }
 
@@ -456,6 +480,7 @@ export class WasmProver {
   }
 
   #fail(error: unknown): void {
+    this.#gpuAvailable = false;
     this.#worker?.terminate();
     this.#worker = undefined;
     this.#initialization = undefined;
@@ -471,7 +496,7 @@ export class WasmProver {
 
   async #call(
     request: WithoutId<WorkerRequest>,
-    transfer: readonly Transferable[] = [],
+    transfer: readonly ArrayBuffer[] = [],
   ): Promise<WorkerResponse> {
     const worker = this.#worker;
     if (worker === undefined) {

@@ -2,6 +2,7 @@ const messages = {
   wasm_prover_error: "Prover operation failed",
   wasm_init_failed:
     "Prover initialization failed; check runtime assets, threads and isolation headers",
+  wasm_gpu_unavailable: "GPU acceleration is unavailable; check WebGPU support and, in Node, install the webgpu peer",
   wasm_worker_failed: "Prover worker failed",
   wasm_worker_not_started: "Prover worker is not started",
   wasm_worker_terminated: "Prover worker terminated",

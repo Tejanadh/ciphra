@@ -20,11 +20,13 @@
     "test:devnet": "npm run test:devnet --workspace @zolana/wallet-example",
     "test:deployments": "node scripts/check-deployments.ts",
     "check": "npm run test && npm run build && npm pack --dry-run --workspace @heliuslabs/spr-web-prover",
-    "check:full": "npm run check && npm run test:browser && npm run test:consumer",
+    "check:full": "npm run check && npm run test:browser && npm run test:consumer && npm run test:node",
     "dev": "npm run dev --workspace @zolana/browser-example",
     "dev:wallet": "npm run dev --workspace @zolana/wallet-example",
     "setup": "npm run build:prover && npm run keys --workspace @zolana/browser-example",
-    "build:runtime": "./scripts/build-runtime.sh"
+    "build:runtime": "./scripts/build-runtime.sh",
+    "test:node": "node scripts/test-node-consumer.mjs",
+    "bench:node": "node scripts/bench-node.mjs"
   },
   "devDependencies": {
     "@puppeteer/browsers": "^3.2.5",

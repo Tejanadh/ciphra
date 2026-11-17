@@ -2,6 +2,10 @@
 
 Local Groth16 proving for Solana Privacy Rings in the browser: [`@heliuslabs/spr-web-prover`](packages/web-prover/README.md), a [wallet example](examples/wallet/README.md) that proves every transaction in the page, and a [prover benchmark](examples/browser).
 
+Also runs in **Node.js 24+** through `@heliuslabs/spr-web-prover/node`, with
+multithreaded WASM, optional WebGPU acceleration, and a persistent key cache.
+See the [Node guide](packages/web-prover/README.md#nodejs).
+
 **Performance.** In Chrome at four threads on an Apple M5 Pro with WebGPU, a warm proof takes about 0.06–0.43 s for 1–24 notes (0.08 s for 2×2). CPU-only is slower (0.28 s for 2×2, 2.6 s for 24×2). The first load of a shape adds key download and decode; later loads use a cached raw form (tens of milliseconds).
 
 ## Packages
@@ -42,6 +46,19 @@ npm run typecheck
 npm run check        # unit tests and builds
 npm run check:full   # also browser + packed-consumer gates
 ```
+
+Node checks and benchmarks (build the prover first):
+
+```sh
+npm run test:node                 # packed install, no GPU dependency required
+SPR_TEST_GPU=1 npm run test:node  # also require real GPU proofs
+npm run bench:node                # single-thread CPU, Rayon and GPU comparisons
+```
+
+`SPR_BENCH_MODES=cpu:4,gpu:4`, `SPR_BENCH_SHAPES=2x2,24x2,merge-24x1`,
+`SPR_BENCH_RUNS=5` and `SPR_BENCH_OUTPUT=timing.json` select the benchmark and
+save its results. It reports initialization, first-use latency and warm verified
+proof latency separately. GPU cases fail if a proof falls back to the CPU.
 
 Devnet e2e (funded key, keyed RPC):
 

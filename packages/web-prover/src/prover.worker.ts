@@ -29,6 +29,7 @@ import {
 let runtime: Runtime | undefined;
 let pooled = false;
 let activeThreads = 0;
+let gpuAvailable = false;
 let loaded: { fileName: string; prover: SprProver } | undefined;
 
 // Rayon's helpers wait for every thread to report ready, and a thread whose script
@@ -38,7 +39,7 @@ const threadPoolTimeoutMs = 30_000;
 /** Magic of a cached raw key (`zopro-raw-3`); those skip worker decompression. */
 const rawKeyMagic = new TextEncoder().encode("zopro-raw3\0\0\0\0\0\0");
 
-async function init(threads: number): Promise<void> {
+async function init(threads: number, gpu: "auto" | "off" | "required" = "auto"): Promise<void> {
   if (runtime !== undefined) return;
   if (!Number.isInteger(threads) || threads < 0 || threads > 64) {
     throw new Error("Threads must be an integer between 0 and 64");
@@ -51,7 +52,7 @@ async function init(threads: number): Promise<void> {
     const module = await importThreadedRuntime();
     await module.default();
     await withTimeout(module.initThreadPool(threads), threadPoolTimeoutMs);
-    if ("gpu" in navigator) await module.init_gpu();
+    await initGpu(module, gpu);
     runtime = module;
     pooled = true;
     activeThreads = threads;
@@ -59,10 +60,17 @@ async function init(threads: number): Promise<void> {
   }
   const module = await importSingleRuntime();
   await module.default();
-  if ("gpu" in navigator) await module.init_gpu();
+  await initGpu(module, gpu);
   runtime = module;
   pooled = false;
   activeThreads = 0;
+}
+
+async function initGpu(module: Runtime, mode: "auto" | "off" | "required"): Promise<void> {
+  if (mode === "off") return;
+  const available = "gpu" in navigator && await module.init_gpu();
+  gpuAvailable = available;
+  if (!available && mode === "required") throw new WasmProverError("wasm_gpu_unavailable");
 }
 
 async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
@@ -133,11 +141,11 @@ async function loadKey(
   return raw.byteLength === 0 ? info : { ...info, raw };
 }
 
-async function prove(body: string): Promise<ProofValue> {
+async function prove(body: string): Promise<ProofValue & { backend: "gpu" | "cpu" }> {
   if (loaded === undefined) throw new Error("no key is loaded");
   const { prover } = loaded;
   try {
-    return await prover.prove(body);
+    return { ...await prover.prove(body), backend: prover.has_gpu() ? "gpu" : "cpu" };
   } catch (error) {
     // A GPU that failed, or whose arithmetic went wrong: the CPU proves
     // from now on.
@@ -147,7 +155,7 @@ async function prove(body: string): Promise<ProofValue> {
     }
     prover.drop_gpu();
     try {
-      return await prover.prove(body);
+      return { ...await prover.prove(body), backend: "cpu" };
     } catch (retried) {
       if (retried === "unverified") throw new WasmProverError("wasm_verify_failed");
       throw retried;
@@ -158,10 +166,11 @@ async function prove(body: string): Promise<ProofValue> {
 async function handle(request: WorkerRequest): Promise<unknown> {
   switch (request.kind) {
     case "init":
-      await init(request.threads);
+      await init(request.threads, request.gpu);
       return {
         initialized: true,
         threads: activeThreads,
+        gpuAvailable,
         rawKeyFormat: requireRuntime().raw_format(),
       };
     case "loadKey":

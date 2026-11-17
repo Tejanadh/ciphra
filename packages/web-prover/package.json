@@ -20,6 +20,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node/index.d.ts",
+      "import": "./dist/node/index.js"
     }
   },
   "scripts": {
@@ -34,9 +38,21 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "webgpu": "0.6.2"
   },
   "publishConfig": {
     "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "peerDependencies": {
+    "webgpu": "^0.6.2"
+  },
+  "peerDependenciesMeta": {
+    "webgpu": {
+      "optional": true
+    }
   }
 }

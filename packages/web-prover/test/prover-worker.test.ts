@@ -153,7 +153,7 @@ it("frees the loaded key before it loads the next", async () => {
 it("returns the runtime's verified proof", async () => {
   await loadKey();
   const response = await send({ id: 3, kind: "prove", body: "{}" });
-  expect(response.value).toEqual({ proof: "{}", witnessMs: 1, proveMs: 2, verifyMs: 3 });
+  expect(response.value).toEqual({ proof: "{}", witnessMs: 1, proveMs: 2, verifyMs: 3, backend: "cpu" });
 });
 
 it("proves again on the CPU when a GPU proof does not verify", async () => {
@@ -164,6 +164,7 @@ it("proves again on the CPU when a GPU proof does not verify", async () => {
   expect(response.ok).toBe(true);
   expect(prover.drop_gpu).toHaveBeenCalledOnce();
   expect(prover.prove).toHaveBeenCalledTimes(2);
+  expect(response.value).toMatchObject({ backend: "cpu" });
 });
 
 it("fails a CPU proof that does not verify", async () => {
