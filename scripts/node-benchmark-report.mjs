@@ -42,12 +42,12 @@ export function render(report, source = "results.json") {
   const lines = [
     "# Node prover time to proof", "",
     `Measured ${report.startedAt.slice(0, 10)} on **${report.cpu}**, ${report.platform}/${report.arch}, Node ${report.node}, ${report.memoryGiB} GiB RAM. GPU binding: Dawn \`webgpu@${report.gpuBinding}\`.`, "",
-    `${report.shapes.length} shapes × ${report.modes.length} modes; **${passed}/${report.results.length} cases passed**. Every returned proof was locally verified; GPU cases require actual GPU execution. The fixtures are synthetic valid requests, not live wallet transactions. No transaction was submitted.`, "",
+    `${report.shapes.length} shapes × ${report.modes.length} modes; **${passed}/${report.results.length} cases passed**. Every returned proof was locally verified; GPU cases require actual GPU execution. Requests are synthetic.`, "",
     "- **Warm:** median of repeated `proveRequest()` calls with the shape already resident. Includes witness generation, proving, local verification and worker messaging; excludes key preparation.",
     "- **Empty cache:** first proof in a fresh process and empty disk cache. Includes worker/GPU initialization, CDN download, key decoding, cache writes, proving and verification. Network and CDN conditions affect this value.",
     "- **Cached restart:** first proof in another process using the decoded disk cache. Network fetches are forbidden in this phase. Includes worker/GPU startup and loading the cached key.",
     `- Each shape/mode gets its own processes and cache. Cases run sequentially. Warm sample count: ${report.iterations}; the ranges below are observed min–max, not percentiles.`, "",
-    "Circuit labels mean input notes → output notes. All SDK-supported shapes are covered when run with `SPR_BENCH_SHAPES=all`; merge 52→1 exceeds the WASM32 runtime's supported memory budget.", "",
+    "Circuit labels mean input notes → output notes. Merge 52→1 exceeds the WASM32 memory budget.", "",
     "## Warm verified proof latency", "", "Milliseconds: **median** (min–max).", "",
     `| Circuit | ${report.modes.map(modeName).join(" | ")} |`,
     `| --- | ${report.modes.map(() => "---:").join(" | ")} |`,
@@ -75,12 +75,8 @@ export function render(report, source = "results.json") {
     `SPR_BENCH_RUNS=${report.iterations} SPR_BENCH_OUTPUT=target/node-benchmark/all-shapes.json npm run bench:node`,
     "node scripts/node-benchmark-report.mjs target/node-benchmark/all-shapes.json target/node-benchmark/all-shapes.md", "```", "",
     `Raw samples, preparation timings, failures and machine metadata: [${basename(source)}](${basename(source)}).`, "",
-    `- Protocol fixture source: \`${report.protocolRevision}\``,
-    `- WASM runtime source: \`${report.runtimeRevision}\``,
-    `- SDK source commit: \`${report.sourceCommit}\``,
-    `- Benchmark script SHA-256: \`${report.harnessSha256}\``,
-    `- Fixture bundle SHA-256: \`${report.fixtureSha256}\``, "",
-    "Results describe this machine and run. They are not network transaction latencies or guarantees for other CPUs, GPUs, drivers or load conditions.", "");
+    "Metadata in the raw file records source revisions and SHA-256 digests of the harness and fixtures.", "",
+    "These timings apply to this host and run. Empty-cache latency also depends on CDN/network conditions.", "");
   return lines.join("\n");
 }
 

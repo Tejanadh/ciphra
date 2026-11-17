@@ -1,6 +1,6 @@
 # Node prover
 
-Node 24+ runs the TypeScript example directly, without a bundler. From the repository root:
+Run the TypeScript example with Node 24+ from the repository root:
 
 ```sh
 npm ci
@@ -8,11 +8,9 @@ npm run build:prover
 node examples/node/prove.ts
 ```
 
-The example preloads the 2→2 proving key, proves a synthetic request and prints
-its proof and elapsed time. No wallet, RPC or prover server is needed. First
-use downloads the public key; later runs reuse `~/.cache/spr-prover`.
+Preloads a key, proves a synthetic 2→2 request and prints the proof and timing.
+First use downloads the public key; later runs reuse the disk cache. GPU is
+used when available, with CPU fallback. No RPC or prover server is needed.
 
-`gpu: "auto"` uses Dawn WebGPU when available and CPU otherwise. Outside this
-workspace, install `@heliuslabs/spr-web-prover` and optionally `webgpu`.
-The 512 MiB resident-key budget enables caching across shapes; it is an estimate
-of key state, not a hard process memory limit. Omit it to keep one loaded shape.
+See the [Node options](../../packages/web-prover/README.md#nodejs) for threads,
+GPU selection and keeping multiple shapes loaded.

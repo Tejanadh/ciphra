@@ -10,92 +10,37 @@ npm install @heliuslabs/spr-web-prover
 
 ## Node.js
 
-Node 24+ can prove locally without a browser or bundler. Import the Node entry;
-it runs the same WASM engine in worker threads, including its Rayon pool.
-Install `webgpu` to enable GPU acceleration through Dawn (Metal, Vulkan or
-Direct3D, depending on the host and drivers):
+Node 24+ uses worker threads and the same WASM runtime. Install the optional
+`webgpu` peer for GPU acceleration:
 
 ```sh
 npm install @heliuslabs/spr-web-prover webgpu
 ```
 
-```ts
-import { SprNodeProver } from "@heliuslabs/spr-web-prover/node";
+See the [runnable TypeScript example](../../examples/node) for preloading a key,
+proving a request and releasing the worker.
 
-const prover = new SprNodeProver({
-  proverUrl: "http://127.0.0.1:3001",
-  threads: 4,
-  gpu: "auto",
-});
-try {
-  const result = await prover.proveRequest(requestJson);
-  console.log(result.backend, result.proveMs, result.verifyMs);
-} finally {
-  prover.terminate();
-}
-```
+- `gpu`: `"auto"` (default), `"off"`, or `"required"` to reject startup without a GPU.
+  Each result's `backend` reports actual execution, including CPU recovery after
+  a GPU failure.
+- `threads`: defaults to available processors, capped at 18; `0` uses single-thread WASM.
+- `cacheDir`: defaults to `~/.cache/spr-prover`; `false` disables disk caching.
+  Only public proving keys are persisted.
+- `residentKeyBudgetBytes`: defaults to `0` (one loaded shape). Set, for example,
+  `512 * 1024 ** 2` to retain multiple shapes with LRU eviction in one worker.
 
-`gpu: "auto"` uses the GPU when available and multithreaded CPU otherwise.
-`gpu: "required"` rejects initialization if no GPU is available; `"off"` disables
-it. `gpuAvailable` reports initialization capability, while each proof's
-`backend` reports actual execution, including a CPU retry after a GPU failure.
-Every returned proof is verified. `threads: 0` selects the single-thread WASM
-runtime; key decompression can still use auxiliary workers.
+Use `prefetch({ shapes })` to prepare the disk cache, or `ensureKey(shape)` to
+make a shape resident. Keep the instance alive between proofs and call
+`terminate()` when finished. `loadedKeys()` lists resident shapes.
 
-The default pool uses available processors, capped at 18. More threads are not
-always faster, especially with a GPU; benchmark your request shapes and host.
-The Node entry caches validated downloads and decoded keys in
-`~/.cache/spr-prover`. Set `cacheDir` to another directory or `false` to disable
-disk caching. Reusing an instance keeps loaded key state available; `prefetch`
-prepares other shapes in the disk cache. Only public proving keys are persisted,
-never requests or witnesses. No globals are installed in your application's thread.
+The resident budget estimates key state using the larger of 8× compressed bytes
+and 3× decoded bytes, when available. It is capped at 1 GiB; proof buffers,
+workers and GPU allocations need additional memory. Keys exceeding the budget
+run alone. Cancellation of active work clears resident state; disk entries survive.
 
-`createFetch()`, cancellation, runtime key sources, and the protocol SDK
-integration below work in Node too. Call `terminate()` when finished to release
-the prover, GPU and nested workers. The `webgpu` peer is optional and is not
-installed for browser-only consumers.
-
-[Time to proof for all 40 supported shapes](../../benchmarks/node/2026-11-17-m5-pro.md)
-compares 18-thread CPU and GPU execution on an Apple M5 Pro with Node 24.21.0.
-Each row includes the median and range of five warm, locally verified proofs,
-plus empty-cache and cached-restart timings. Raw samples and reproduction
-commands accompany the report. Circuit labels mean input notes → output notes.
-
-Run `npm run bench:node` in this repository to measure your host. First use also
-requires downloading and decoding the proving key; `prefetch()` during
-application startup moves that preparation ahead of a spend. Keep the prover
-instance alive to retain its current shape in memory.
-
-### Keep frequently used shapes loaded
-
-The default retains one shape. Opt in to a bounded LRU cache on hosts with
-memory to spare:
-
-```ts
-const prover = new SprNodeProver({
-  proverUrl: "http://localhost:3001",
-  residentKeyBudgetBytes: 512 * 1024 ** 2,
-});
-await prover.ensureKey(shapeByLabel("2x2"));
-await prover.ensureKey(shapeByLabel("8x2"));
-```
-
-Both shapes can now be selected without reading or rebuilding their keys.
-The cache shares one worker and thread pool. It evicts the least recently used
-shape before admitting another; a shape exceeding the budget runs alone.
-`loadedKeys()` reports the current residents. Termination or active cancellation
-clears them; the disk cache survives.
-
-The budget is **estimated key state**, not a hard RSS/GPU memory cap: each key
-is charged the larger of 8× its pinned compressed size and 3× its decoded byte
-size, when available. The option is capped at 1 GiB to leave headroom in the
-WASM32 runtime; decoding, proof buffers, workers and allocator retention need
-additional memory. Default `0` preserves single-shape behavior.
-
-`prefetch()` prepares disk entries and skips already cached shapes. Use
-`ensureKey()` for each shape you want resident; cache capacity still applies.
-See the [minimal TypeScript example](../../examples/node) and
-[alternating-shape measurements](../../benchmarks/node/2026-11-17-switching.md).
+Benchmarks: [all 40 shapes](../../benchmarks/node/2026-11-17-m5-pro.md) and
+[alternating shapes](../../benchmarks/node/2026-11-17-switching.md), with raw
+samples and reproduction commands.
 
 ## Browser
 

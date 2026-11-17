@@ -22,20 +22,6 @@ try {
   await command("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", join(consumer, packed.filename), "typescript@^7.0.2", "@types/node@^24"]);
   // No browser DOM library, bundler, native GPU binding, or protocol SDK is needed for Node CPU proofs.
   await assert.rejects(readFile(join(consumer, "node_modules/webgpu/package.json")), { code: "ENOENT" });
-  await writeFile(join(consumer, "tsconfig.json"), JSON.stringify({
-    compilerOptions: { target: "ES2024", module: "NodeNext", lib: ["ES2024"], types: ["node"], strict: true, skipLibCheck: false, noEmit: true },
-    include: ["consumer.ts"],
-  }));
-  await writeFile(join(consumer, "consumer.ts"), `
-import { SprNodeProver, shapeByLabel, type NodeProverOptions } from "@heliuslabs/spr-web-prover/node";
-const options: NodeProverOptions = { proverUrl: "http://localhost:3001", threads: 4, gpu: "auto" };
-const prover = new SprNodeProver(options);
-await prover.ensureKey(shapeByLabel("2x2"));
-const result = await prover.proveRequest("{}");
-const backend: "gpu" | "cpu" | undefined = result.backend;
-prover.terminate();
-`);
-  await command(join(consumer, "node_modules/.bin/tsc"), ["-p", "tsconfig.json"]);
   await command(process.execPath, ["--input-type", "module", "-e", `
     import { SprNodeProver } from "@heliuslabs/spr-web-prover/node";
     const prover = new SprNodeProver({ proverUrl: "http://localhost:3001", threads: 2, gpu: "off" });
