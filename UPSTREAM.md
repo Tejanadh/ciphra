@@ -39,3 +39,22 @@ Source mapping:
 - `poc/web` -> `examples/browser` (same branch and commit)
 
 `fixtures/` holds valid requests for each benchmarked shape on trees of their own, from zk-tools' `zopro/tools/zolana/fixtures` at the runtime's revision: zolana's request and merge fixtures with the shape changed.
+
+`fixtures/node-shapes.json.gz` covers all SDK-supported transfer and merge
+shapes. Transfers are generated and constraint-checked by the protocol's
+`TestRequestFixture` helpers at `key-catalog-source.json`'s revision; merges
+come from `zopro/tools/spr/fixtures` at `runtime.lock.json`'s revision.
+The bundle records both revisions and contains synthetic requests only.
+Regenerate with Go 1.27 and local source checkouts (the protocol checkout must
+be clean and at the pinned revision):
+
+```sh
+python3 scripts/generate-node-fixtures.py \
+  --protocol-source /path/to/privacy-rings \
+  --runtime-source /path/to/zk-tools
+```
+
+The generator temporarily adds a Go test to the protocol checkout and removes
+it afterward. The Node benchmark checks actual proving-key identity and locally
+verifies every returned proof. Merge 52×1 remains outside the SDK's supported
+WASM32 shapes; its key exceeds the runtime's memory budget.

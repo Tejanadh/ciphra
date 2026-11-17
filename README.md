@@ -52,13 +52,25 @@ Node checks and benchmarks (build the prover first):
 ```sh
 npm run test:node                 # packed install, no GPU dependency required
 SPR_TEST_GPU=1 npm run test:node  # also require real GPU proofs
-npm run bench:node                # single-thread CPU, Rayon and GPU comparisons
+npm run bench:node                # all supported shapes, multithreaded CPU and GPU
 ```
 
 `SPR_BENCH_MODES=cpu:4,gpu:4`, `SPR_BENCH_SHAPES=2x2,24x2,merge-24x1`,
 `SPR_BENCH_RUNS=5` and `SPR_BENCH_OUTPUT=timing.json` select the benchmark and
-save its results. It reports initialization, first-use latency and warm verified
-proof latency separately. GPU cases fail if a proof falls back to the CPU.
+save its results. Defaults are all 40 supported shapes, CPU and GPU with up to
+18 threads, and five warm proofs per case. Use `cpu:0,cpu:4,gpu:4` to compare
+single-thread WASM, Rayon and GPU, or `cpu:4` on a host without a GPU.
+Each case uses isolated processes and an empty disk cache, followed by a cached
+process restart with network fetches forbidden. Results are checkpointed after
+every case; failures remain in the report. GPU cases fail on CPU fallback.
+
+See [time to proof for every shape](benchmarks/node/2026-11-17-m5-pro.md),
+including warm medians/ranges, empty-cache startup and cached restarts.
+Generate a Markdown report from a completed run:
+
+```sh
+node scripts/node-benchmark-report.mjs timing.json timing.md
+```
 
 Devnet e2e (funded key, keyed RPC):
 

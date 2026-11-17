@@ -55,23 +55,16 @@ integration below work in Node too. Call `terminate()` when finished to release
 the prover, GPU and nested workers. The `webgpu` peer is optional and is not
 installed for browser-only consumers.
 
-Measured on an Apple M5 Pro, Node 24.21.0 (median of three warm, locally
-verified proofs; download, key preparation and worker startup excluded):
+[Time to proof for all 40 supported shapes](../../benchmarks/node/2026-11-17-m5-pro.md)
+compares 18-thread CPU and GPU execution on an Apple M5 Pro with Node 24.21.0.
+Each row includes the median and range of five warm, locally verified proofs,
+plus empty-cache and cached-restart timings. Raw samples and reproduction
+commands accompany the report. Circuit labels mean input notes → output notes.
 
-| Circuit | Single CPU thread | 18 CPU threads | GPU + 18 threads |
-| --- | ---: | ---: | ---: |
-| Transfer 2×2 | 1,080 ms | 128 ms | 70 ms |
-| Transfer 16×2 | 7,404 ms | 676 ms | 251 ms |
-| Transfer 24×2 | 12,518 ms | 1,116 ms | 369 ms |
-| Merge 24×1 | 12,294 ms | 1,079 ms | 366 ms |
-
-These are local proving measurements on one host, not network transaction
-latencies or a guarantee for other hardware. Run `npm run bench:node` in this
-repository to measure your host, including first-use costs separately.
-With an empty cache on the same host, the first 24×2 proof took 9.4 s:
-2.2 s downloading 145 MB and 6.5 s preparing the key. A new worker with the
-decoded key cached took about 0.85 s including startup and its first proof.
-Use `prefetch()` during application startup to move preparation ahead of a spend.
+Run `npm run bench:node` in this repository to measure your host. First use also
+requires downloading and decoding the proving key; `prefetch()` during
+application startup moves that preparation ahead of a spend. Keep the prover
+instance alive to retain its current shape in memory.
 
 ## Browser
 
