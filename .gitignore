@@ -9,3 +9,13 @@ examples/browser/public/fixtures/
 *.zopro
 *.wasm
 .DS_Store
+
+# Secrets, Credentials & Local Environment
+.env
+.env.*
+!.env.example
+*.env
+*.env.local
+*.local
+id.json
+

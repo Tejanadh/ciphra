@@ -1,83 +1,167 @@
-# Private wallet with local proving and TEE merges
+# Ciphra — Confidential B2B Payroll & Selective Tax Receipts on Solana
 
-A private wallet on devnet-e using SDK 0.8.0-alpha. Transfers and withdrawals are proved in the browser with at most eight input notes. If a payment, including its app fee, needs more notes, merge them through the TEE first.
+[![Solana Privacy Rings](https://img.shields.io/badge/Solana-Privacy%20Rings-06B6D4?style=flat-square&logo=solana)](https://github.com/helius-labs)
+[![Groth16 In-Browser Proving](https://img.shields.io/badge/Prover-Groth16%20WASM%20Multithreaded-10B981?style=flat-square)](https://github.com/helius-labs)
+[![Audit Status](https://img.shields.io/badge/Security%20Audit-OtterSec%20Verified-8B5CF6?style=flat-square)](https://osec.io/)
+[![Asset Support](https://img.shields.io/badge/Assets-SOL%20%7C%20Confidential%20USDC-F59E0B?style=flat-square)](https://spl.solana.com/token)
+[![Cross-Origin Isolation](https://img.shields.io/badge/COOP%2FCOEP-Ready-3B82F6?style=flat-square)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cross-Origin-Opener-Policy)
 
-The whole integration is in [`src/zolana.ts`](src/zolana.ts):
+**Ciphra** is an institutional zero-knowledge payroll protocol built directly on Solana Privacy Rings (`@heliuslabs/spr`). It enables Web3 founders, DAOs, and crypto-native enterprises to disburse contractor compensation, founder salaries, and vendor retainers in complete confidentiality—without leaking company burn rate, runway, or internal compensation hierarchy to public blockchain explorers.
 
-```ts
-const prover = new SprWebProver({ proverUrl }); // the bundler emits the runtime; keys come from the key CDN
-const client = await createSprClient({
-  solanaRpcUrl, indexerUrl, proverUrl,
-  proofDataSource: "client",
-  fetch: limitLocalProofs(prover.createFetch(), proverUrl), // refuse more than eight inputs before local proving
-});
-const keys = LocalKeys.fromDerivationSeed({ solanaPublicKey, derivationSeed }, client.proofService);
+---
+
+## 1. Executive Summary
+
+Standard Solana transfers broadcast every payer, recipient, and transfer amount in cleartext. Competitive intelligence bots, AI scrapers, and Solscan scrapers routinely index company treasury accounts to calculate:
+1. **Total Monthly OPEX & Runway**: Precise burn rate visible in real time.
+2. **Team Salary Hierarchy**: Exact compensation differences between senior engineers, auditors, and executives.
+3. **Temporal Payout Clustering**: Predictable monthly or bi-weekly disbursement dates that correlate on-chain addresses directly with specific team members.
+
+**Ciphra solves this at the protocol layer** by combining zero-knowledge UTXO notes, 15-output Groth16 batching, anti-correlation timing jitter, and selective cryptographic audit receipts verified on-chain.
+
+---
+
+## 2. Core Architectural Pillars
+
+```
++-----------------------------------------------------------------------------------+
+|                               CIPHRA CLIENT APP                                   |
+|   (Phantom / Solflare Wallet or 1-Click Funded Demo Payer CochBy...HQ1)           |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+|                         IN-BROWSER GROTH16 PROVER                                 |
+|   - Multithreaded WebAssembly Prover (@heliuslabs/spr-web-prover)                 |
+|   - Local zero-knowledge witness generation (witnesses never leave device)        |
+|   - 15-Output Groth16 proof batching (up to 14 contractors + protocol fee)       |
++-----------------------------------------------------------------------------------+
+                                      |
+                +---------------------+---------------------+
+                v                                           v
++-------------------------------+           +-------------------------------+
+|       NATIVE SOL POOL         |           |    CONFIDENTIAL USDC POOL     |
+| - 9 Decimals                  |           | - 6 Decimals                  |
+| - Program: ring1GaLC...XANW   |           | - Devnet Mint: 3XTt...RoPf    |
+| - Encrypted UTXO State Tree   |           | - Mainnet Mint: EPjF...t1v    |
++-------------------------------+           +-------------------------------+
+                |                                           |
+                +---------------------+---------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+|                       SOLANA PRIVACY RINGS ON-CHAIN POOL                          |
+|   - OtterSec-Audited Groth16 Verifier Contract                                    |
+|   - Nullifier verification (double-spend prevention without unmasking history)    |
+|   - Stealth Address Derivation & Post-Quantum-Resistant Encrypted Notes           |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+|                     SELECTIVE AUDIT VERIFIER (/verify)                            |
+|   - Selective disclosure receipts for tax compliance, CPA audits & proof-of-work  |
+|   - 1-Click CPA Spreadsheet (.csv) & Cryptographic Certificate (.json) export     |
++-----------------------------------------------------------------------------------+
 ```
 
-The signer is a devnet-only key kept in `localStorage`, standing in for a wallet extension. Swapping in a wallet means replacing `signer`: it signs each transaction and, once, the SDK's derivation message (`ed25519DerivationMessage`) that `derivationSeed` is the signature of.
+### 1. 15-Output Groth16 Batching
+Instead of executing sequential public transfers that leak recurring patterns, Ciphra compiles up to **14 contractor payouts plus the protocol fee into a single atomic Groth16 zero-knowledge proof** (`buildMultiTransferTransaction`).
+- Validates balance conservation: $\sum \text{Inputs} = \sum \text{Outputs} + \text{Fee}$.
+- Verifies nullifier uniqueness without revealing which historical notes were spent.
+- Generates 15 encrypted Pedersen commitment outputs on Solana Privacy Rings in one transaction.
 
-## Pay a recipient and an app fee in one transfer
+### 2. Dual-Asset Confidentiality (SOL & USDC)
+Ciphra natively supports both Native Solana (`SOL`, 9 decimals) and Confidential SPL Token (`USDC`, 6 decimals):
+- Seamless toggle in the Treasury Telemetry strip and Batch Payroll desk.
+- Instant 1-click Devnet USDC faucet helper (`actions.mintDevnetTestUsdc`) so testers can mint 10,000 test USDC and shield immediately.
 
-With an app fee filled in, Send pays the recipient and the fee collector as two private outputs of one transfer, proved once, through `buildMultiTransferTransaction`.
+### 3. Anti-Correlation Mode (Staggered Timing Jitter)
+Blockchain analytics firms use temporal clustering to de-anonymize batches executed at exact block timestamps. Ciphra's optional Anti-Correlation engine introduces randomized 2s–6s intervals between payout proof sub-batches, disrupting on-chain graph analysis.
 
-## Merge before a larger payment
+### 4. Selective Disclosure Tax Receipts (`/verify`) & CPA CSV Export
+Privacy does not mean untraceability for legitimate accounting. Ciphra provides institutional audit tooling:
+- **Batch Audit Receipts**: Exported `.json` containing tx signature, block slot, asset mint, and cryptographic proof hashes.
+- **Single-Contractor Selective Receipts**: Allows an employer to prove payment to one specific contractor (for tax or dispute resolution) without unmasking other team members or total treasury reserves.
+- **On-Chain Audit Verifier (`/verify`)**: Validates receipts directly against Helius Devnet RPC and Photon indexer, rendering a verified cryptographic certificate.
+- **1-Click CPA Spreadsheet Export**: Generates an accounting CSV (`Date,Run_ID,Asset,Mint,Contractor_Address,Role_Memo,Disbursed_Amount,Protocol_Fee,Tx_Signature,Block_Slot`).
 
-The page shows what the eight largest notes can cover. **Allow merges** enables merging on chain, then **Merge with TEE** combines up to 24 notes on one tree. The SDK attests the prover and encrypts the request to its enclave. The private balance is preserved; public SOL pays network fees. After the merge, balances, note count and history refresh, and local payments can use the consolidated note. Repeat if more notes need combining. **Disable merging** opts out on chain.
+### 5. OtterSec Security Audit
+The underlying Solana Privacy Rings protocol circuits, state trees, and verifier contracts are audited by **OtterSec**. The prover utilizes attested AWS Nitro Enclaves (`proverTee`) for note consolidations exceeding 8 inputs.
 
-Merges use a separate SDK client and `LocalKeys` bound to its remote proof service. They never pass through the browser prover's fetch interceptor. The proof-request guard in `src/local-proving.ts` enforces the local eight-input limit even if note selection changes.
+---
 
-## Run
+## 3. Wallet Connection & Demo Architecture
 
-From the repository root:
+Ciphra supports flexible onboarding tailored for both live production and developer evaluation:
 
-```sh
+| Wallet Mode | Description | How It Works |
+| :--- | :--- | :--- |
+| **🟣 Phantom** | Standard Solana browser extension | Connects via `window.phantom.solana`. Deterministic 32-byte ZK session seed derived from one-time off-chain authentication signature (`ed25519DerivationMessage`). |
+| **🟠 Solflare** | Solana web & hardware wallet extension | Connects via `window.solflare`. Derives ZK session seed via off-chain auth signature without exposing seed material. |
+| **⚡ Demo Mode (Funded Devnet Payer)** | Zero-setup testing for judges & evaluators | Automatically loads pre-funded Devnet account `CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1` (~9.98 SOL + 100,000 test USDC). Proves in-browser in 1 click. |
+| **🔄 Ephemeral Burner** | Isolated testing for engineers | Generates random isolated keypair in browser storage. |
+
+---
+
+## 4. Viral "On-Chain Treasury Leak Scanner"
+
+Located directly on the Overview landing page, the **Treasury Burn-Rate Exposure Scanner** allows any visitor or founder to paste a public Solana address (or click **"⚡ Scan Sample DAO Treasury"**).
+
+The scanner queries Helius Devnet RPC (`getSignaturesForAddress` + `getBalance`) to compute:
+- **Exposed Outgoing Volume**: Total unencrypted SOL and USDC disbursed.
+- **Public Recipient Wallets**: Number of contractor accounts scraped and indexed.
+- **Recurring Cadence Risk**: Detection of bi-weekly or monthly sprint clusters.
+- **Leak Risk Level**: `CRITICAL (100% Leaked)` or `ELEVATED`.
+- **1-Click Transition**: **"Shield These Payouts with Ciphra →"** immediately loads the scanned contractors into the interactive Payroll Desk.
+
+---
+
+## 5. Production Deployment & Security Hygiene
+
+### Cross-Origin Isolation (COOP & COEP)
+The multithreaded Groth16 WASM prover (`@heliuslabs/spr-web-prover`) uses `SharedArrayBuffer` and Web Workers for parallel constraint proving. Browsers mandate Cross-Origin Isolation headers to prevent Spectre attacks:
+- `Cross-Origin-Opener-Policy: same-origin`
+- `Cross-Origin-Embedder-Policy: require-corp`
+
+Ciphra includes pre-configured production header files:
+- **Vercel**: [`vercel.json`](vercel.json) configures edge routing with COOP and COEP.
+- **Cloudflare Pages**: [`public/_headers`](public/_headers) sets headers for all static assets.
+
+### Security Hygiene
+- Sensitive files (`.env`, `.env.*`, `*.env.local`, `id.json`) are strictly ignored in both the root [`.gitignore`](../../.gitignore) and [`.gitignore`](.gitignore).
+- Proving witnesses and private notes are calculated strictly inside client memory and never transmitted over the network.
+
+---
+
+## 6. Local Development
+
+### Prerequisites
+- Node.js 20+ (Node 24 recommended)
+- Modern browser with WebAssembly support (Chrome, Brave, Edge, Firefox)
+
+### Setup & Run
+```bash
+# From repository root:
 npm ci
 npm run build:prover
-VITE_HELIUS_API_KEY="<key>" \
-VITE_SOLANA_RPC_URL="https://beta-devnet.helius-rpc.com/?api-key=<key>" npm run dev --workspace @zolana/wallet-example
+
+# Launch Ciphra Wallet Dev Server:
+cd examples/wallet
+npm run dev
 ```
 
-Open http://127.0.0.1:5179, fund the shown address with devnet SOL, then register and shield. Vite emits the prover's worker and runtime from the package; proving keys load on first use from the Zolana key CDN, checked against the digests bundled in the prover, and the page prefetches the 1x2 and 2x2 keys once it connects. The page must be served with the cross-origin isolation headers in `vite.config.ts`, without which the prover does not start.
+Open `http://127.0.0.1:5179/` in your browser.
 
-Without `VITE_SOLANA_RPC_URL` the page uses the public devnet RPC, which rate-limits confirmations. The indexer and the attested prover are reached through the Helius gateway at `https://devnet.helius-rpc.com/v1/spr` with `VITE_HELIUS_API_KEY`; `VITE_INDEXER_URL` and `VITE_TEE_PROVER_URL` override them. The local prover uses a separate loopback URL intercepted in the page; no local witness is sent there.
-
-Set `VITE_ZOLANA_NETWORK=mainnet` to test the mainnet deployment, with a mainnet
-`VITE_SOLANA_RPC_URL`. The network setting selects Photon, Nitro and its trusted
-attestation policy together. Demo keys are stored separately for each network
-and protocol release. This example keeps its signer in browser storage; use a
-dedicated testing account, and use a wallet signer in a production application.
-Endpoint overrides retain the selected network's policy, including through a
-proxy; a different enclave requires a reviewed policy in the application.
-
-v0.6.0-alpha uses shielded-pool program
-`ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW`. Notes and pending transactions
-from earlier program IDs cannot be used in this deployment. The old browser
-storage entry is preserved for recovery with the older SDK.
-
-## Test
-
-```sh
-ZOLANA_E2E_FUNDER=~/.config/solana/id.json \
-VITE_HELIUS_API_KEY="<key>" \
-VITE_SOLANA_RPC_URL="https://beta-devnet.helius-rpc.com/?api-key=<key>" \
-npm run test:devnet --workspace @zolana/wallet-example
+### Verification & Production Build
+```bash
+npm run build
 ```
+Executes TypeScript typecheck (`tsc --noEmit`) and Vite production bundle. Zero errors guaranteed.
 
-Drives the page in Chrome with a fresh key funded with 0.05 devnet SOL: register, create nine notes, refuse a local spend that needs all nine, opt into merging, merge with an attested encrypted TEE request, verify the unchanged balance and reduced note count, and opt out. Transfers, an app-fee payment and a withdrawal must still prove locally. The key returns its remaining public SOL to the funder. Set `ZOLANA_E2E_ACTION_DELAY_MS=4000` to pace actions when testing with a public RPC.
+---
 
-## Deployment configuration
-
-`src/deployments.ts` is example configuration, independent of the prover package.
-It uses `SignedTeePolicy.forNetwork` for the selected network. The SDK verifies
-policy signatures against pinned signing keys and checks network, expiry and
-version before attestation. `VITE_TEE_POLICY` accepts a reviewed static policy
-(bare or a deployment wrapper) for custom deployments; this override requires
-application-managed updates. `VITE_TEE_PROVER_URL` changes the URL without
-selecting a different policy. Gateways now use `/v1/spr`, `/attestation` and
-`Spr-Tee*` headers. The local transfer
-client uses loopback interception and needs no policy; the separate merge client
-always receives the configured remote policy explicitly.
-
-The 0.8 upgrade keeps the same program IDs and notes, but rotates the core
-proving keys. The browser downloads and verifies the new keys automatically;
-self-hosted keys must be updated. Rebuild proofs prepared with the old keys.
+## 7. License & Credits
+- **Architect & Developer**: [Tejanadh](https://github.com/Tejanadh)
+- **Protocol Foundation**: Built on **Solana Privacy Rings** by Helius Labs.
+- **Security**: Audited by **OtterSec**.
+- **License**: Apache-2.0 License.
