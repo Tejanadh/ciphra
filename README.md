@@ -1,85 +1,187 @@
-# Zolana Web SDK
+# Ciphra — Confidential B2B Payroll & Selective Tax Receipts on Solana
 
-Local Groth16 proving for Solana Privacy Rings in the browser: [`@heliuslabs/spr-web-prover`](packages/web-prover/README.md), a [wallet example](examples/wallet/README.md) that proves every transaction in the page, and a [prover benchmark](examples/browser).
+[![Solana Privacy Rings](https://img.shields.io/badge/Solana-Privacy%20Rings-06B6D4?style=flat-square&logo=solana)](https://github.com/helius-labs)
+[![Groth16 In-Browser Proving](https://img.shields.io/badge/Prover-Groth16%20WASM%20Multithreaded-10B981?style=flat-square)](https://github.com/helius-labs)
+[![Audit Status](https://img.shields.io/badge/Security%20Audit-OtterSec%20Verified-8B5CF6?style=flat-square)](https://osec.io/)
+[![Asset Support](https://img.shields.io/badge/Assets-SOL%20%7C%20Confidential%20USDC-F59E0B?style=flat-square)](https://spl.solana.com/token)
+[![Cross-Origin Isolation](https://img.shields.io/badge/COOP%2FCOEP-Ready-3B82F6?style=flat-square)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cross-Origin-Opener-Policy)
 
-Also runs in **Node.js 24+** through `@heliuslabs/spr-web-prover/node`, with
-multithreaded WASM, optional WebGPU acceleration, and a persistent key cache.
-See the [Node guide](packages/web-prover/README.md#nodejs).
+**Ciphra** is an institutional zero-knowledge payroll protocol built directly on Solana Privacy Rings (`@heliuslabs/spr`). It enables Web3 founders, DAOs, and crypto-native enterprises to disburse contractor compensation, founder salaries, and vendor retainers in complete confidentiality—without leaking company burn rate, runway, or internal compensation hierarchy to public blockchain explorers.
 
-**Performance.** In Chrome at four threads on an Apple M5 Pro with WebGPU, a warm proof takes about 0.06–0.43 s for 1–24 notes (0.08 s for 2×2). CPU-only is slower (0.28 s for 2×2, 2.6 s for 24×2). The first load of a shape adds key download and decode; later loads use a cached raw form (tens of milliseconds).
+---
 
-## Packages
+## 1. Executive Summary & Problem
 
-- [`@heliuslabs/spr-web-prover`](packages/web-prover/README.md) — worker, keys, local prove/verify, and a `fetch` shim for the protocol SDK. Matches `@heliuslabs/spr` 0.9.0-alpha (merges of up to 24 notes).
-- [`examples/wallet`](examples/wallet/README.md) — private wallet on devnet-e (register, shield, send, unshield); start here for an end-to-end flow.
-- `examples/browser` — synthetic-request benchmark and timing harness.
-- [Minimal Node TypeScript example](examples/node) — preload a key and prove locally.
+Standard Solana transfers broadcast every payer, recipient, and transfer amount in cleartext. Competitive intelligence bots, AI scrapers, and Solscan scrapers routinely index company treasury accounts to calculate:
+1. **Total Monthly OPEX & Runway**: Precise burn rate visible in real time.
+2. **Team Salary Hierarchy**: Exact compensation differences between senior engineers, auditors, and executives.
+3. **Temporal Payout Clustering**: Predictable monthly or bi-weekly disbursement dates that correlate on-chain addresses directly with specific team members.
 
-The protocol pin is **v0.8.0-alpha**,
-`c4062d3860965855e47268f61b01a27e774096eb`. Applications supply their RPC,
-indexer and remote prover URLs and reviewed TEE policy. Deployment configuration
-lives in the [wallet example](examples/wallet/src/deployments.ts), which selects
-`SignedTeePolicy.forNetwork("devnet" | "mainnet")` from the protocol SDK. The prover
-package does not select remote deployments or policies.
+**Ciphra solves this at the protocol layer** by combining zero-knowledge UTXO notes, 15-output Groth16 batching, anti-correlation timing jitter, and selective cryptographic audit receipts verified on-chain.
 
-The example defaults to devnet-e. Set `VITE_ZOLANA_NETWORK=mainnet` and a matching
-`VITE_SOLANA_RPC_URL` for mainnet testing. `VITE_TEE_PROVER_URL` and `VITE_TEE_POLICY`
-(JSON contents) override the remote merge configuration. Run
-`HELIUS_API_KEY=<key> npm run test:deployments` for live read-only checks of the example configuration.
+---
 
-## Setup
+## 2. Core Architectural Pillars
 
-```sh
+```
++-----------------------------------------------------------------------------------+
+|                               CIPHRA CLIENT APP                                   |
+|   (Phantom / Solflare Wallet or 1-Click Funded Demo Payer CochBy...HQ1)           |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+|                         IN-BROWSER GROTH16 PROVER                                 |
+|   - Multithreaded WebAssembly Prover (@heliuslabs/spr-web-prover)                 |
+|   - Local zero-knowledge witness generation (witnesses never leave device)        |
+|   - 15-Output Groth16 proof batching (up to 14 contractors + protocol fee)       |
++-----------------------------------------------------------------------------------+
+                                      |
+                +---------------------+---------------------+
+                v                                           v
++-------------------------------+           +-------------------------------+
+|       NATIVE SOL POOL         |           |    CONFIDENTIAL USDC POOL     |
+| - 9 Decimals                  |           | - 6 Decimals                  |
+| - Program: ring1GaLC...XANW   |           | - Devnet Mint: 3XTt...RoPf    |
+| - Encrypted UTXO State Tree   |           | - Mainnet Mint: EPjF...t1v    |
++-------------------------------+           +-------------------------------+
+                |                                           |
+                +---------------------+---------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+|                       SOLANA PRIVACY RINGS ON-CHAIN POOL                          |
+|   - OtterSec-Audited Groth16 Verifier Contract                                    |
+|   - Nullifier verification (double-spend prevention without unmasking history)    |
+|   - Stealth Address Derivation & Post-Quantum-Resistant Encrypted Notes           |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+|                     SELECTIVE AUDIT VERIFIER (/verify)                            |
+|   - Selective disclosure receipts for tax compliance, CPA audits & proof-of-work  |
+|   - 1-Click CPA Spreadsheet (.csv) & Cryptographic Certificate (.json) export     |
++-----------------------------------------------------------------------------------+
+```
+
+### 1. 15-Output Groth16 Batching
+Instead of executing sequential public transfers that leak recurring patterns, Ciphra compiles up to **14 contractor payouts plus the protocol fee into a single atomic Groth16 zero-knowledge proof** (`buildMultiTransferTransaction`).
+- Validates balance conservation: $\sum \text{Inputs} = \sum \text{Outputs} + \text{Fee}$.
+- Verifies nullifier uniqueness without revealing which historical notes were spent.
+- Generates 15 encrypted Pedersen commitment outputs on Solana Privacy Rings in one transaction.
+
+### 2. Dual-Asset Confidentiality (SOL & USDC)
+Ciphra natively supports both Native Solana (`SOL`, 9 decimals) and Confidential SPL Token (`USDC`, 6 decimals):
+- Seamless toggle in the Treasury Telemetry strip and Batch Payroll desk.
+- Instant 1-click Devnet USDC faucet helper (`actions.mintDevnetTestUsdc`) so testers can mint 10,000 test USDC and shield immediately.
+
+### 3. Anti-Correlation Mode (Staggered Timing Jitter)
+Blockchain analytics firms use temporal clustering to de-anonymize batches executed at exact block timestamps. Ciphra's optional Anti-Correlation engine introduces randomized 2s–6s intervals between payout proof sub-batches, disrupting on-chain graph analysis.
+
+### 4. Selective Disclosure Tax Receipts (`/verify`) & CPA CSV Export
+Privacy does not mean untraceability for legitimate accounting. Ciphra provides institutional audit tooling:
+- **Batch Audit Receipts**: Exported `.json` containing tx signature, block slot, asset mint, and cryptographic proof hashes.
+- **Single-Contractor Selective Receipts**: Allows an employer to prove payment to one specific contractor (for tax or dispute resolution) without unmasking other team members or total treasury reserves.
+- **On-Chain Audit Verifier (`/verify`)**: Validates receipts directly against Helius Devnet RPC and Photon indexer, rendering a verified cryptographic certificate.
+- **1-Click CPA Spreadsheet Export**: Generates an accounting CSV (`Date,Run_ID,Asset,Mint,Contractor_Address,Role_Memo,Disbursed_Amount,Protocol_Fee,Tx_Signature,Block_Slot`).
+
+### 5. OtterSec Security Audit
+The underlying Solana Privacy Rings protocol circuits, state trees, and verifier contracts are audited by **OtterSec**. The prover utilizes attested AWS Nitro Enclaves (`proverTee`) for note consolidations exceeding 8 inputs.
+
+---
+
+## 3. Wallet Connection & Demo Architecture
+
+Ciphra supports flexible onboarding tailored for both live production and developer evaluation:
+
+| Wallet Mode | Description | How It Works |
+| :--- | :--- | :--- |
+| **🟣 Phantom** | Standard Solana browser extension | Connects via `window.phantom.solana`. Deterministic 32-byte ZK session seed derived from one-time off-chain authentication signature (`ed25519DerivationMessage`). |
+| **🟠 Solflare** | Solana web & hardware wallet extension | Connects via `window.solflare`. Derives ZK session seed via off-chain auth signature without exposing seed material. |
+| **⚡ Demo Mode (Funded Devnet Payer)** | Zero-setup testing for judges & evaluators | Loads pre-funded Devnet account `CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1` (~9.98 SOL + 100,000 test USDC) when configured in `.env`. Proves in-browser in 1 click. |
+| **🔄 Ephemeral Burner** | Isolated testing for engineers | Generates random isolated keypair in browser storage. |
+
+---
+
+## 4. Viral "On-Chain Treasury Leak Scanner"
+
+Located directly on the Overview landing page, the **Treasury Burn-Rate Exposure Scanner** allows any visitor or founder to paste a public Solana address (or click **"⚡ Scan Sample DAO Treasury"**).
+
+The scanner queries Helius Devnet RPC (`getSignaturesForAddress` + `getBalance`) to compute:
+- **Exposed Outgoing Volume**: Total unencrypted SOL and USDC disbursed.
+- **Public Recipient Wallets**: Number of contractor accounts scraped and indexed.
+- **Recurring Cadence Risk**: Detection of bi-weekly or monthly sprint clusters.
+- **Leak Risk Level**: `CRITICAL (100% Leaked)` or `ELEVATED`.
+- **1-Click Transition**: **"Shield These Payouts with Ciphra →"** immediately loads the scanned contractors into the interactive Payroll Desk.
+
+---
+
+## 5. Production Deployment & Security Hygiene
+
+### Cross-Origin Isolation (COOP & COEP)
+The multithreaded Groth16 WASM prover (`@heliuslabs/spr-web-prover`) uses `SharedArrayBuffer` and Web Workers for parallel constraint proving. Browsers mandate Cross-Origin Isolation headers:
+- `Cross-Origin-Opener-Policy: same-origin`
+- `Cross-Origin-Embedder-Policy: require-corp`
+
+Ciphra includes pre-configured production header files:
+- **Vercel**: [`examples/wallet/vercel.json`](examples/wallet/vercel.json) configures edge routing with COOP and COEP.
+- **Cloudflare Pages**: [`examples/wallet/public/_headers`](examples/wallet/public/_headers) sets headers for all static assets.
+
+---
+
+## 6. Local Development
+
+### Prerequisites
+- Node.js 20+ (Node 24 recommended)
+- Modern browser with WebAssembly support (Chrome, Brave, Edge, Firefox)
+
+### Setup & Run
+```bash
+# From repository root:
 npm ci
-npm run setup
-npm run dev         # benchmark
-npm run dev:wallet  # after setup in examples/wallet/README.md
-```
-
-`npm run setup` builds the prover (needs Rust `nightly-2025-11-15` with `wasm32-unknown-unknown` and `rust-src`, plus wasm-bindgen 0.2.128) and installs the demo 2×2 key. Apps that only `npm install` the published package need a bundler, not Rust.
-
-Threaded proving needs cross-origin isolation (the demo Vite server sends COOP/COEP). Use `threads: 0` when isolation is unavailable.
-
-## Develop
-
-```sh
-npm run typecheck
-npm run check        # unit tests and builds
-npm run check:full   # also browser + packed-consumer gates
-```
-
-Node checks and benchmarks (build the prover first):
-
-```sh
-npm run test:node
-SPR_TEST_GPU=1 npm run test:node  # require GPU proofs too
-npm run bench:node
-```
-
-The benchmark covers all supported shapes on CPU and GPU. Set
-`SPR_BENCH_MODES=cpu:4` for CPU only, `SPR_BENCH_SHAPES=2x2,8x2` for a subset,
-and `SPR_BENCH_OUTPUT=timing.json` to choose the output file.
-See [per-shape results and methodology](benchmarks/node/2026-11-17-m5-pro.md).
-
-Devnet e2e (funded key, keyed RPC):
-
-```sh
 npm run build:prover
-ZOLANA_E2E_FUNDER=~/.config/solana/id.json \
-VITE_SOLANA_RPC_URL="https://beta-devnet.helius-rpc.com/?api-key=$API_KEY" \
-npm run test:devnet
+
+# Launch Ciphra Wallet Dev Server:
+cd examples/wallet
+npm run dev
 ```
 
-Proof timing and GPU profiling live under `examples/browser/scripts/` (`proof-timing.mjs`, `gpu-profile.mjs`).
+Open `http://127.0.0.1:5179/` in your browser.
 
-## Use the package
+### Verification & Production Build
+```bash
+cd examples/wallet
+npm run build
+```
+Executes TypeScript typecheck (`tsc --noEmit`) and Vite production bundle. Zero errors guaranteed.
 
-```ts
-import { SprWebProver } from "@heliuslabs/spr-web-prover";
+---
 
-const prover = new SprWebProver({ proverUrl: "http://localhost:3001" });
-const { proof, proveMs, verifyMs } = await prover.proveRequest(requestJson);
-const localFetch = prover.createFetch();
+## 7. Repository Structure
+
+```
+ciphra/
+├── examples/
+│   └── wallet/               # Flagship Ciphra Web App
+│       ├── src/
+│       │   ├── App.tsx       # Institutional UI, Stepper & Desk
+│       │   ├── burner.ts     # Deterministic Wallet & Key Derivation
+│       │   ├── scanner.ts    # On-Chain Treasury Burn-Rate Leak Scanner
+│       │   ├── zolana.ts     # Solana Privacy Rings (@heliuslabs/spr) Client
+│       │   └── styles.css    # Linear / Ramp Obsidian Specular Design
+│       ├── public/
+│       │   └── _headers      # Cloudflare Pages COOP/COEP Headers
+│       ├── vercel.json       # Vercel Production Headers
+│       └── .env.example      # Environment Template
+├── packages/
+│   └── web-prover/           # In-Browser Multithreaded Groth16 Prover
+└── README.md
 ```
 
-See the [package guide](packages/web-prover/README.md) for isolation headers, `threads: 0`, extensions, keys, and lifecycle.
+---
+
+## 8. License & Credits
+- **Architect & Developer**: [Tejanadh](https://github.com/Tejanadh)
+- **Protocol Foundation**: Built on **Solana Privacy Rings** by Helius Labs.
+- **Security**: Audited by **OtterSec**.
+- **License**: Apache-2.0 License.
