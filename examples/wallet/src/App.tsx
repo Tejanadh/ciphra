@@ -350,7 +350,7 @@ export function App(): React.ReactElement {
         if (cancelled) return;
         setSession(opened);
         void opened.prover
-          .prefetch({ shapes: [shapeByLabel("1x2"), shapeByLabel("2x2")], onProgress: (update) => setKeys(keyStatus(update)) })
+          .prefetch({ shapes: [shapeByLabel("1x2"), shapeByLabel("2x2")], onProgress: (update: KeyProgress) => setKeys(keyStatus(update)) })
           .then(
             () => setKeys("Proving keys ready"),
             () => setKeys("Proving keys load on first use"),
