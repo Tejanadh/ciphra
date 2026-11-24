@@ -28,6 +28,7 @@ import {
   actions,
   attachCommitmentHashes,
   computeSingleReceiptHash,
+  createSingleContractorReceipt,
   endpoints,
   network,
   networkLabel,
@@ -115,20 +116,20 @@ const SAMPLE_AUDIT_RECEIPT = {
   mint: "11111111111111111111111111111111",
   decimals: 9,
   runId: "ciphra-demo-sprint-42",
-  slot: "341829104",
   formattedDate: "2026-11-22T20:30:00.000Z",
-  txSignature: "5EejmXv5V3ehJ5eDtZAPXVKFsUMv6jeJh2Phb8BvsbChvsXgE2XRJZZuoRFqZMw5HFtiMtT4chzPg3cjHzy78aay",
-  receiptCommitmentHash: "e635e424c960c07042595603e6ffe09b5ead6a6a14551fa0784ded134383247c",
+  payerPubkey: "CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1",
+  payerSignature: "5wcPwg1iUzp9ZgvtjmCcqMWHJ8qqtFrPr4AfeivhgUc7fztKhoo9UasafhJC62eMHs35uzc4ZVtgMuKzGDgeo83",
+  receiptCommitmentHash: "07bd08c33d2e740e19a44f82fbfb0305815dcb63184b82bb8bc67870ce77b0fa",
   chunks: [
     {
-      chunkIndex: 1,
+      chunkIndex: 0,
       txSignature: "5EejmXv5V3ehJ5eDtZAPXVKFsUMv6jeJh2Phb8BvsbChvsXgE2XRJZZuoRFqZMw5HFtiMtT4chzPg3cjHzy78aay",
-      slot: "341829104",
+      slot: "525180127",
       payouts: [
         {
           recipient: "B5BQmVv7tjCBaHm8TwLdgY5jKxXpU14gptEspTouKgro",
-          amountSol: 0.003,
           amount: 0.003,
+          amountSol: 0.003,
           memo: "Lead Rust Engineer — Sprint 42 Payout",
         },
       ],
@@ -482,8 +483,8 @@ export function App(): React.ReactElement {
       setProofStage(4);
       setPayrollProgress(`Stage 4/4: Finalized ${selectedAsset} batch on Solana Devnet!`);
 
-      // Attach tamper-evident SHA-256 commitment hash to the report
-      const reportWithHash = await attachCommitmentHashes(report);
+      // Attach tamper-evident SHA-256 commitment hash & Ed25519 signature to the report
+      const reportWithHash = await attachCommitmentHashes(session, report);
 
       // Store run report
       const updatedRuns = [reportWithHash, ...recentPayrollRuns].slice(0, 20);
@@ -519,37 +520,11 @@ export function App(): React.ReactElement {
     }
   };
 
-  // Export single-contractor receipt with SHA-256 commitment hash
+  // Export single-contractor receipt with Ed25519 payer signature & commitment hash
   const exportSingleContractorReceipt = async (run: BatchPayrollReport, payout: PayrollPayoutRecord) => {
-    const chunk = run.chunks[0];
-    const txSig = chunk?.txSignature ?? "";
-    const slot = chunk?.slot ?? "";
-    const asset = run.asset ?? "SOL";
-    const decimals = run.decimals ?? (asset === "USDC" ? 6 : 9);
-    const mint = run.mint ?? (asset === "USDC" ? USDC_MINT.toString() : SOL_MINT.toString());
-    const receiptCommitmentHash = await computeSingleReceiptHash({
-      network: run.network,
-      txSignature: txSig,
-      slot,
-      asset,
-      mint,
-      payout,
-    });
-    const single = {
-      protocol: "Ciphra",
-      version: "1.0",
-      receiptType: "SingleContractorDisbursement",
-      asset,
-      mint,
-      decimals,
-      txSignature: txSig,
-      slot: slot,
-      timestamp: run.timestamp,
-      payout,
-      network: run.network,
-      receiptCommitmentHash,
-    };
-    downloadJson(`ciphra-receipt-${asset}-${payout.recipient.slice(0, 8)}.json`, single);
+    if (!session) return;
+    const single = await createSingleContractorReceipt(session, run, payout);
+    downloadJson(`ciphra-receipt-${run.asset || "SOL"}-${payout.recipient.slice(0, 8)}.json`, single);
   };
 
   // Payroll desk totals with float precision formatting
@@ -1709,9 +1684,16 @@ export function App(): React.ReactElement {
               {/* Holographic Verified Certificate Card */}
               {verificationResult && (
                 <div className="holographic-cert">
-                  <div style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem", padding: "0.25rem 0.65rem", borderRadius: "9999px", background: "rgba(16, 185, 129, 0.15)", border: "1px solid rgba(16, 185, 129, 0.4)", color: "#34D399", fontSize: "0.75rem", fontWeight: 700, marginBottom: "0.75rem" }}>
-                    <span>🛡️</span>
-                    <span>CRYPTOGRAPHICALLY VERIFIED ON-CHAIN</span>
+                  <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem", padding: "0.25rem 0.65rem", borderRadius: "9999px", background: "rgba(16, 185, 129, 0.15)", border: "1px solid rgba(16, 185, 129, 0.4)", color: "#34D399", fontSize: "0.75rem", fontWeight: 700, marginBottom: "0.75rem", flexWrap: "wrap" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.35rem" }}>
+                      <span>🛡️</span>
+                      <span>CRYPTOGRAPHICALLY VERIFIED ON-CHAIN</span>
+                    </div>
+                    {verificationResult.payerSignatureVerified && (
+                      <span style={{ paddingLeft: "0.5rem", borderLeft: "1px solid rgba(16, 185, 129, 0.4)", color: "#10B981" }}>
+                        ✓ Ed25519 Payer Authenticated
+                      </span>
+                    )}
                   </div>
 
                   <h3 style={{ fontSize: "1.35rem", fontWeight: 800, marginBottom: "0.25rem" }}>
@@ -1762,6 +1744,15 @@ export function App(): React.ReactElement {
                     </div>
 
                     <div className="cert-meta-item">
+                      <span className="cert-meta-label">Attesting Payer Wallet</span>
+                      <span className="cert-meta-val mono" style={{ fontSize: "0.85rem" }}>
+                        {verificationResult.payerPubkey
+                          ? `${verificationResult.payerPubkey.slice(0, 6)}…${verificationResult.payerPubkey.slice(-6)}`
+                          : "—"}
+                      </span>
+                    </div>
+
+                    <div className="cert-meta-item">
                       <span className="cert-meta-label">Protocol Fee (0.25%)</span>
                       <span className="cert-meta-val" style={{ fontSize: "0.85rem" }}>
                         {verificationResult.protocolFee
@@ -1801,6 +1792,21 @@ export function App(): React.ReactElement {
                           : "— No hash in receipt"}
                       </span>
                     </div>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>Ed25519 Payer Signature: </span>
+                      <span style={{ color: verificationResult.payerSignatureVerified ? "#34D399" : "#F87171", fontWeight: 600 }}>
+                        {verificationResult.payerSignatureVerified
+                          ? `✓ Authenticated (${verificationResult.payerPubkey?.slice(0, 4)}…${verificationResult.payerPubkey?.slice(-4)})`
+                          : "✕ Unverified Signature"}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Institutional Attestation Clarification */}
+                  <div style={{ marginTop: "0.75rem", padding: "0.6rem 0.85rem", background: "rgba(16, 185, 129, 0.05)", border: "1px solid rgba(16, 185, 129, 0.2)", borderRadius: "0.375rem" }}>
+                    <p style={{ fontSize: "0.775rem", margin: 0, color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                      <strong style={{ color: "#34D399" }}>Institutional Attestation Notice:</strong> Disclosed payout amounts, recipient addresses, and block slots are cryptographically bound and attested by the payer's Ed25519 digital signature, while shielded company treasury balances remain zero-knowledge encrypted on Solana Privacy Rings.
+                    </p>
                   </div>
 
                   {verificationResult.receiptCommitmentHash && (
