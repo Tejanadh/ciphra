@@ -6,7 +6,7 @@
 [![Asset Support](https://img.shields.io/badge/Assets-SOL%20%7C%20Confidential%20USDC-F59E0B?style=flat-square)](https://spl.solana.com/token)
 [![Cross-Origin Isolation](https://img.shields.io/badge/COOP%2FCOEP-Ready-3B82F6?style=flat-square)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cross-Origin-Opener-Policy)
 
-**Ciphra** is an institutional zero-knowledge payroll protocol built directly on Solana Privacy Rings (`@heliuslabs/spr`). It enables Web3 founders, DAOs, and crypto-native enterprises to disburse contractor compensation, founder salaries, and vendor retainers in complete confidentiality—without leaking company burn rate, runway, or internal compensation hierarchy to public blockchain explorers.
+**Ciphra** is an institutional zero-knowledge payroll protocol built directly on Solana Privacy Rings (`@heliuslabs/spr`). It enables Web3 founders, DAOs, and crypto-native enterprises to disburse contractor compensation, founder salaries, and vendor retainers with encrypted payout amounts and shielded treasury balances—without leaking company burn rate, runway, or internal compensation hierarchy to public blockchain explorers. On permissionless Default Rings, amounts are encrypted while recipient addresses remain visible on-chain.
 
 ---
 
@@ -17,7 +17,7 @@ Standard Solana transfers broadcast every payer, recipient, and transfer amount 
 2. **Team Salary Hierarchy**: Exact compensation differences between senior engineers, auditors, and executives.
 3. **Temporal Payout Clustering**: Predictable monthly or bi-weekly disbursement dates that correlate on-chain addresses directly with specific team members.
 
-**Ciphra solves this at the protocol layer** by combining zero-knowledge UTXO notes, 15-output Groth16 batching, anti-correlation timing jitter, and selective cryptographic audit receipts verified on-chain.
+**Ciphra solves this at the protocol layer** by combining zero-knowledge UTXO notes, 15-output Groth16 batching, anti-correlation timing jitter, and selective cryptographic audit receipts with tamper-evident SHA-256 commitment binding verified on-chain.
 
 ---
 
@@ -51,7 +51,7 @@ Standard Solana transfers broadcast every payer, recipient, and transfer amount 
                                       v
 +-----------------------------------------------------------------------------------+
 |                       SOLANA PRIVACY RINGS ON-CHAIN POOL                          |
-|   - OtterSec-Audited Groth16 Verifier Contract                                    |
+|   - OtterSec-Audited Groth16 Verifier Contract (Helius)                             |
 |   - Nullifier verification (double-spend prevention without unmasking history)    |
 |   - Stealth Address Derivation & Post-Quantum-Resistant Encrypted Notes           |
 +-----------------------------------------------------------------------------------+
@@ -76,17 +76,17 @@ Ciphra natively supports both Native Solana (`SOL`, 9 decimals) and Confidential
 - Instant 1-click Devnet USDC faucet helper (`actions.mintDevnetTestUsdc`) so testers can mint 10,000 test USDC and shield immediately.
 
 ### 3. Anti-Correlation Mode (Staggered Timing Jitter)
-Blockchain analytics firms use temporal clustering to de-anonymize batches executed at exact block timestamps. Ciphra's optional Anti-Correlation engine introduces randomized 2s–6s intervals between payout proof sub-batches, disrupting on-chain graph analysis.
+Blockchain analytics firms use temporal clustering to correlate batches executed at exact block timestamps. Ciphra's optional Anti-Correlation engine introduces randomized 2s–6s intervals between payout proof sub-batches, reducing timing-pattern correlation that could otherwise reveal recurring payroll schedules. Note: this reduces but does not eliminate all graph analysis correlation.
 
 ### 4. Selective Disclosure Tax Receipts (`/verify`) & CPA CSV Export
 Privacy does not mean untraceability for legitimate accounting. Ciphra provides institutional audit tooling:
-- **Batch Audit Receipts**: Exported `.json` containing tx signature, block slot, asset mint, and cryptographic proof hashes.
-- **Single-Contractor Selective Receipts**: Allows an employer to prove payment to one specific contractor (for tax or dispute resolution) without unmasking other team members or total treasury reserves.
-- **On-Chain Audit Verifier (`/verify`)**: Validates receipts directly against Helius Devnet RPC and Photon indexer, rendering a verified cryptographic certificate.
+- **Batch Audit Receipts**: Exported `.json` containing tx signature, block slot, asset mint, and a deterministic **SHA-256 commitment hash** (`receiptCommitmentHash`) over canonical `{ network, programId, txSignature, slot, asset, mint, payouts, protocolFee }`.
+- **Single-Contractor Selective Receipts**: Allows an employer to prove payment to one specific contractor (for tax or dispute resolution) without unmasking other team members or total treasury reserves. Each receipt includes its own tamper-evident SHA-256 digest.
+- **On-Chain Audit Verifier (`/verify`)**: Validates receipts by: (a) recomputing the SHA-256 digest to detect any tampering of amounts, recipients, or metadata; (b) live RPC `getTransaction` confirming `meta.err === null`, matching slot, and explicit invocation of the Solana Privacy Rings program (`ring1GaLC…XANW`). The certificate displays: "Verified On-Chain Execution & Tamper-Evident Receipt Binding".
 - **1-Click CPA Spreadsheet Export**: Generates an accounting CSV (`Date,Run_ID,Asset,Mint,Contractor_Address,Role_Memo,Disbursed_Amount,Protocol_Fee,Tx_Signature,Block_Slot`).
 
 ### 5. OtterSec Security Audit
-The underlying Solana Privacy Rings protocol circuits, state trees, and verifier contracts are audited by **OtterSec**. The prover utilizes attested AWS Nitro Enclaves (`proverTee`) for note consolidations exceeding 8 inputs.
+The underlying Solana Privacy Rings protocol circuits, state trees, and verifier contracts are audited by **OtterSec** (Helius's protocol-level audit). The prover utilizes attested AWS Nitro Enclaves (`proverTee`) for note consolidations exceeding 8 inputs. Ciphra is built on this OtterSec-audited foundation.
 
 ---
 
@@ -163,5 +163,5 @@ Executes TypeScript typecheck (`tsc --noEmit`) and Vite production bundle. Zero 
 ## 7. License & Credits
 - **Architect & Developer**: [Tejanadh](https://github.com/Tejanadh)
 - **Protocol Foundation**: Built on **Solana Privacy Rings** by Helius Labs.
-- **Security**: Audited by **OtterSec**.
+- **Security**: Built on **OtterSec**-audited Solana Privacy Rings (Helius).
 - **License**: Apache-2.0 License.

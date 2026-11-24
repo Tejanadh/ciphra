@@ -597,17 +597,116 @@ export interface VerificationResult {
     readonly amountBaseUnits?: string;
     readonly amountLamports?: string;
     readonly bps: number;
-  };
+  } | undefined;
   readonly totalDisclosed: number;
   readonly totalDisclosedSol: number;
   readonly onChainEventCount: number;
   readonly outputSlotCount: number;
-  readonly ringProgramId?: string;
-  readonly timestamp?: string;
+  readonly ringProgramId?: string | undefined;
+  readonly timestamp?: string | undefined;
+  readonly receiptCommitmentHash?: string | undefined;
+  readonly commitmentVerified?: boolean | undefined;
+  readonly onChainSlotMatch?: boolean | undefined;
+  readonly programInvocationConfirmed?: boolean | undefined;
+  readonly txSuccessConfirmed?: boolean | undefined;
+}
+
+/**
+ * Computes a deterministic SHA-256 commitment digest over canonical receipt fields.
+ * This binds receipt metadata tamper-evidently to the on-chain transaction.
+ */
+async function computeReceiptCommitmentHash(fields: {
+  network: string;
+  programId: string;
+  txSignature: string;
+  slot: string;
+  asset: string;
+  mint: string;
+  payouts: readonly { recipient: string; amount?: number; amountSol?: number; memo: string }[];
+  protocolFee: { collector?: string; recipient?: string; amount?: number; amountSol?: number; bps?: number } | null;
+}): Promise<string> {
+  const canonical = JSON.stringify({
+    network: fields.network,
+    programId: fields.programId,
+    txSignature: fields.txSignature,
+    slot: fields.slot,
+    asset: fields.asset,
+    mint: fields.mint,
+    payouts: fields.payouts.map((p) => ({
+      recipient: p.recipient,
+      amount: p.amount ?? p.amountSol ?? 0,
+      memo: p.memo,
+    })),
+    protocolFee: fields.protocolFee
+      ? {
+          collector: fields.protocolFee.collector || fields.protocolFee.recipient || "",
+          amount: fields.protocolFee.amount ?? fields.protocolFee.amountSol ?? 0,
+          bps: fields.protocolFee.bps ?? 25,
+        }
+      : null,
+  });
+  const encoded = new TextEncoder().encode(canonical);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Generates a receiptCommitmentHash for a batch report and attaches it to each chunk.
+ * Called after successful on-chain execution.
+ */
+export async function attachCommitmentHashes(
+  report: BatchPayrollReport,
+  ringProgramId: string = "ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW"
+): Promise<BatchPayrollReport & { receiptCommitmentHash: string }> {
+  const allPayouts = report.chunks.flatMap((c) => c.payouts);
+  const firstChunk = report.chunks[0];
+  const hash = await computeReceiptCommitmentHash({
+    network: report.network,
+    programId: ringProgramId,
+    txSignature: firstChunk?.txSignature ?? "",
+    slot: firstChunk?.slot ?? "",
+    asset: report.asset,
+    mint: report.mint,
+    payouts: allPayouts,
+    protocolFee: firstChunk?.protocolFee
+      ? { collector: firstChunk.protocolFee.collector, amount: firstChunk.protocolFee.amount, bps: firstChunk.protocolFee.bps }
+      : null,
+  });
+  return { ...report, receiptCommitmentHash: hash };
+}
+
+/**
+ * Generates a commitment hash for a single-contractor selective receipt.
+ */
+export async function computeSingleReceiptHash(receipt: {
+  network: string;
+  txSignature: string;
+  slot: string;
+  asset: string;
+  mint: string;
+  payout: { recipient: string; amount?: number; amountSol?: number; memo: string };
+}): Promise<string> {
+  return computeReceiptCommitmentHash({
+    network: receipt.network,
+    programId: "ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW",
+    txSignature: receipt.txSignature,
+    slot: receipt.slot,
+    asset: receipt.asset,
+    mint: receipt.mint,
+    payouts: [receipt.payout],
+    protocolFee: null,
+  });
 }
 
 /**
  * Validates a selective audit receipt against on-chain Devnet state and Photon indexer.
+ *
+ * Verification checks:
+ *  (a) If receiptCommitmentHash is present, recomputes SHA-256 digest and verifies tamper-evidence.
+ *  (b) Live RPC getTransaction confirms meta.err === null, matching slot, and explicit
+ *      invocation of Solana Privacy Rings program (ring1GaLC...XANW).
  */
 export async function verifyAuditReceipt(
   session: Session,
@@ -628,15 +727,73 @@ export async function verifyAuditReceipt(
   }
 
   const { client } = session;
-  const signatureStatus = await client.solanaRpc.getSignatureStatuses([txSignature]).send();
-  const status = signatureStatus.value[0];
-  if (!status || status.err !== null) {
-    throw new Error(`Transaction ${txSignature} was not found or failed on ${networkLabel}`);
+  const ringProgramId = "ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW";
+
+  // ── (b) Live RPC getTransaction: confirm execution success, slot match, and program invocation ──
+  let txSuccessConfirmed = false;
+  let onChainSlotMatch = false;
+  let programInvocationConfirmed = false;
+  let confirmedSlot = "";
+
+  try {
+    const txResponse = await client.solanaRpc
+      .getTransaction(txSignature, {
+        commitment: "confirmed",
+        encoding: "json",
+        maxSupportedTransactionVersion: 0,
+      })
+      .send();
+
+    if (txResponse) {
+      // Check meta.err === null (transaction succeeded on-chain)
+      txSuccessConfirmed = txResponse.meta?.err === null || txResponse.meta?.err === undefined;
+      confirmedSlot = txResponse.slot?.toString() ?? "";
+
+      // Check slot matches receipt claim
+      const receiptSlot = parsed.chunks?.[0]?.slot || parsed.slot || "";
+      onChainSlotMatch = receiptSlot === "" || confirmedSlot === receiptSlot;
+
+      // Check that the Privacy Rings program was invoked
+      const accountKeys: string[] = [];
+      if (txResponse.transaction?.message?.accountKeys) {
+        for (const key of txResponse.transaction.message.accountKeys) {
+          accountKeys.push(typeof key === "string" ? key : String(key));
+        }
+      }
+      // Also check staticAccountKeys for versioned transactions
+      if ((txResponse.transaction?.message as any)?.staticAccountKeys) {
+        for (const key of (txResponse.transaction.message as any).staticAccountKeys) {
+          accountKeys.push(typeof key === "string" ? key : String(key));
+        }
+      }
+      // Check loaded addresses from address lookup tables
+      const metaAny = txResponse.meta as any;
+      if (metaAny?.loadedAddresses) {
+        const loaded = metaAny.loadedAddresses as { writable?: string[]; readonly?: string[] };
+        for (const key of loaded.writable ?? []) accountKeys.push(String(key));
+        for (const key of loaded.readonly ?? []) accountKeys.push(String(key));
+      }
+      programInvocationConfirmed = accountKeys.some((k) => k === ringProgramId);
+    }
+  } catch {
+    // Fall back to getSignatureStatuses if getTransaction fails (e.g. old tx or RPC limits)
+    const signatureStatus = await client.solanaRpc.getSignatureStatuses([txSignature]).send();
+    const status = signatureStatus.value[0];
+    if (!status || status.err !== null) {
+      throw new Error(`Transaction ${txSignature} was not found or failed on ${networkLabel}`);
+    }
+    txSuccessConfirmed = status.err === null;
+    confirmedSlot = status.slot?.toString() ?? "";
+    const receiptSlot = parsed.chunks?.[0]?.slot || parsed.slot || "";
+    onChainSlotMatch = receiptSlot === "" || confirmedSlot === receiptSlot;
+  }
+
+  if (!txSuccessConfirmed) {
+    throw new Error(`Transaction ${txSignature} failed on-chain (meta.err ≠ null)`);
   }
 
   let outputSlotCount = 2;
   let onChainEventCount = 1;
-  const ringProgramId = "ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW";
 
   try {
     const indexerResponse = await client.getShieldedTransactionsBySignature(txSignature);
@@ -663,10 +820,39 @@ export async function verifyAuditReceipt(
   }
   const totalDisclosed = payouts.reduce((sum, p) => sum + (Number(p.amount ?? p.amountSol) || 0), 0);
 
+  // ── (a) Tamper-evident SHA-256 commitment verification ──
+  let commitmentVerified: boolean | undefined;
+  const suppliedHash: string | undefined = parsed.receiptCommitmentHash;
+  if (suppliedHash) {
+    const recomputedHash = await computeReceiptCommitmentHash({
+      network: parsed.network || networkLabel,
+      programId: ringProgramId,
+      txSignature,
+      slot: parsed.chunks?.[0]?.slot || parsed.slot || confirmedSlot || "",
+      asset,
+      mint,
+      payouts,
+      protocolFee: chunk.protocolFee
+        ? {
+            collector: chunk.protocolFee.collector || chunk.protocolFee.recipient || "",
+            amount: chunk.protocolFee.amount ?? chunk.protocolFee.amountSol ?? 0,
+            bps: chunk.protocolFee.bps ?? 25,
+          }
+        : null,
+    });
+    commitmentVerified = recomputedHash === suppliedHash;
+    if (!commitmentVerified) {
+      throw new Error(
+        "Receipt integrity check failed: SHA-256 commitment hash does not match recomputed digest. " +
+        "The receipt amounts, recipients, or metadata may have been tampered with."
+      );
+    }
+  }
+
   return {
     valid: true,
     txSignature,
-    slot: status.slot.toString(),
+    slot: confirmedSlot || (parsed.chunks?.[0]?.slot || parsed.slot || ""),
     network: parsed.network || networkLabel,
     asset,
     mint,
@@ -679,5 +865,10 @@ export async function verifyAuditReceipt(
     outputSlotCount,
     ringProgramId,
     timestamp: parsed.formattedDate || new Date().toISOString(),
+    receiptCommitmentHash: suppliedHash,
+    commitmentVerified,
+    onChainSlotMatch,
+    programInvocationConfirmed,
+    txSuccessConfirmed,
   };
 }

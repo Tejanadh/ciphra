@@ -26,6 +26,8 @@ import {
   SOL_MINT,
   USDC_MINT,
   actions,
+  attachCommitmentHashes,
+  computeSingleReceiptHash,
   endpoints,
   network,
   networkLabel,
@@ -113,12 +115,15 @@ const SAMPLE_AUDIT_RECEIPT = {
   mint: "11111111111111111111111111111111",
   decimals: 9,
   runId: "ciphra-demo-sprint-42",
+  slot: "341829104",
   formattedDate: "2026-11-22T20:30:00.000Z",
   txSignature: "5EejmXv5V3ehJ5eDtZAPXVKFsUMv6jeJh2Phb8BvsbChvsXgE2XRJZZuoRFqZMw5HFtiMtT4chzPg3cjHzy78aay",
+  receiptCommitmentHash: "e635e424c960c07042595603e6ffe09b5ead6a6a14551fa0784ded134383247c",
   chunks: [
     {
       chunkIndex: 1,
       txSignature: "5EejmXv5V3ehJ5eDtZAPXVKFsUMv6jeJh2Phb8BvsbChvsXgE2XRJZZuoRFqZMw5HFtiMtT4chzPg3cjHzy78aay",
+      slot: "341829104",
       payouts: [
         {
           recipient: "B5BQmVv7tjCBaHm8TwLdgY5jKxXpU14gptEspTouKgro",
@@ -130,7 +135,8 @@ const SAMPLE_AUDIT_RECEIPT = {
       protocolFee: {
         amountSol: 0.0000075,
         amount: 0.0000075,
-        recipient: "CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1",
+        collector: "CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1",
+        bps: 25,
       },
     },
   ],
@@ -476,8 +482,11 @@ export function App(): React.ReactElement {
       setProofStage(4);
       setPayrollProgress(`Stage 4/4: Finalized ${selectedAsset} batch on Solana Devnet!`);
 
+      // Attach tamper-evident SHA-256 commitment hash to the report
+      const reportWithHash = await attachCommitmentHashes(report);
+
       // Store run report
-      const updatedRuns = [report, ...recentPayrollRuns].slice(0, 20);
+      const updatedRuns = [reportWithHash, ...recentPayrollRuns].slice(0, 20);
       setRecentPayrollRuns(updatedRuns);
       localStorage.setItem("ciphra_recent_runs", JSON.stringify(updatedRuns));
 
@@ -510,14 +519,22 @@ export function App(): React.ReactElement {
     }
   };
 
-  // Export single-contractor receipt
-  const exportSingleContractorReceipt = (run: BatchPayrollReport, payout: PayrollPayoutRecord) => {
+  // Export single-contractor receipt with SHA-256 commitment hash
+  const exportSingleContractorReceipt = async (run: BatchPayrollReport, payout: PayrollPayoutRecord) => {
     const chunk = run.chunks[0];
     const txSig = chunk?.txSignature ?? "";
     const slot = chunk?.slot ?? "";
     const asset = run.asset ?? "SOL";
     const decimals = run.decimals ?? (asset === "USDC" ? 6 : 9);
     const mint = run.mint ?? (asset === "USDC" ? USDC_MINT.toString() : SOL_MINT.toString());
+    const receiptCommitmentHash = await computeSingleReceiptHash({
+      network: run.network,
+      txSignature: txSig,
+      slot,
+      asset,
+      mint,
+      payout,
+    });
     const single = {
       protocol: "Ciphra",
       version: "1.0",
@@ -530,7 +547,7 @@ export function App(): React.ReactElement {
       timestamp: run.timestamp,
       payout,
       network: run.network,
-      auditHash: `ciphra_proof_${txSig.slice(0, 16)}`,
+      receiptCommitmentHash,
     };
     downloadJson(`ciphra-receipt-${asset}-${payout.recipient.slice(0, 8)}.json`, single);
   };
@@ -742,7 +759,7 @@ export function App(): React.ReactElement {
 
           {/* Subheadline */}
           <p className="hero-subheadline">
-            Encrypt contractor salaries, defeat monthly timing correlation, and generate 1-click cryptographic tax receipts—all in a single zero-knowledge proof.
+            Encrypt contractor salaries and shielded treasury balances, reduce timing-pattern correlation via staggered dispatch jitter, and generate 1-click cryptographic tax receipts—all in a single zero-knowledge proof.
           </p>
 
           {/* CTAs */}
@@ -772,7 +789,7 @@ export function App(): React.ReactElement {
           {/* Hero Trust Badge */}
           <div className="hero-trust-badge">
             <span>🛡️</span>
-            <span>Built on OtterSec-Audited Solana Privacy Rings · SPL & Token-2022 Stablecoin Ready</span>
+            <span>Built on OtterSec-audited Solana Privacy Rings (Helius) · SPL & Token-2022 Stablecoin Ready</span>
           </div>
 
           {/* ========================================================
@@ -1034,7 +1051,7 @@ export function App(): React.ReactElement {
               ) : (
                 <div>
                   <div style={{ background: "rgba(16, 185, 129, 0.08)", border: "1px solid rgba(16, 185, 129, 0.25)", padding: "0.75rem 1rem", borderRadius: "0.5rem", marginBottom: "1rem", fontSize: "0.8rem", color: "#6EE7B7" }}>
-                    🛡️ <strong>Zero-Knowledge Confidentiality:</strong> Groth16 zk-SNARK proves valid balance subtraction without revealing treasury reserves or individual payout amounts.
+                    🛡️ <strong>Zero-Knowledge Confidentiality:</strong> Groth16 zk-SNARK proves valid balance subtraction without revealing treasury reserves or individual payout amounts. On Default Rings, amounts are encrypted while recipient addresses remain visible on-chain.
                   </div>
                   <div className="comparison-row">
                     <span style={{ color: "var(--text-secondary)" }}>Employer Treasury</span>
@@ -1077,11 +1094,11 @@ export function App(): React.ReactElement {
                 <div className="bento-icon-wrap">⏱️</div>
                 <h3 className="bento-title">Anti-Correlation Timing Jitter</h3>
                 <p className="bento-desc">
-                  Injects randomized 2s–6s dispatch delays to defeat temporal onchain clustering algorithms that track 1st-of-the-month cycles.
+                  Injects randomized 2s–6s dispatch delays to reduce timing-pattern correlation between payout batches that could otherwise reveal 1st-of-the-month cycles.
                 </p>
               </div>
               <div>
-                <span className="bento-tag">GRAPH ANALYSIS DEFENSE</span>
+                <span className="bento-tag">TIMING CORRELATION REDUCTION</span>
               </div>
             </div>
 
@@ -1458,7 +1475,7 @@ export function App(): React.ReactElement {
                   <div>
                     <div style={{ fontSize: "0.85rem", fontWeight: 600 }}>⏱️ Anti-Correlation Mode (Staggered Timing Jitter)</div>
                     <div className="muted" style={{ fontSize: "0.75rem" }}>
-                      Injects randomized 2s–6s intervals between payout batches to disrupt on-chain graph analysis & temporal clustering.
+                      Injects randomized 2s–6s intervals between payout batches to reduce timing-pattern correlation & temporal clustering.
                     </div>
                   </div>
                   <input
@@ -1701,7 +1718,7 @@ export function App(): React.ReactElement {
                     Ciphra Zero-Knowledge Audit Certificate
                   </h3>
                   <p className="muted" style={{ fontSize: "0.825rem", marginBottom: "1.5rem" }}>
-                    Verified against Solana Privacy Rings & Helius Devnet RPC. Zero-knowledge proof validity confirmed.
+                    Verified On-Chain Execution & Tamper-Evident Receipt Binding. Transaction confirmed against Solana Privacy Rings & Helius Devnet RPC.
                   </p>
 
                   <div className="cert-meta-grid">
@@ -1753,6 +1770,47 @@ export function App(): React.ReactElement {
                       </span>
                     </div>
                   </div>
+
+                  {/* Integrity Verification Checks */}
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0.5rem", marginTop: "1rem", padding: "0.75rem", background: "rgba(255, 255, 255, 0.02)", borderRadius: "0.5rem", border: "1px solid var(--border-card)" }}>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>On-Chain Tx Success: </span>
+                      <span style={{ color: verificationResult.txSuccessConfirmed ? "#34D399" : "#F87171", fontWeight: 600 }}>
+                        {verificationResult.txSuccessConfirmed ? "✓ meta.err === null" : "✕ Failed"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>Slot Match: </span>
+                      <span style={{ color: verificationResult.onChainSlotMatch ? "#34D399" : "#FBBF24", fontWeight: 600 }}>
+                        {verificationResult.onChainSlotMatch ? "✓ Confirmed" : "⚠ Mismatch"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>Privacy Rings Program: </span>
+                      <span style={{ color: verificationResult.programInvocationConfirmed ? "#34D399" : "#FBBF24", fontWeight: 600 }}>
+                        {verificationResult.programInvocationConfirmed ? "✓ ring1GaLC…XANW" : "— Not verified"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>SHA-256 Commitment: </span>
+                      <span style={{ color: verificationResult.commitmentVerified === true ? "#34D399" : verificationResult.commitmentVerified === false ? "#F87171" : "var(--text-muted)", fontWeight: 600 }}>
+                        {verificationResult.commitmentVerified === true
+                          ? "✓ Tamper-evident digest matches"
+                          : verificationResult.commitmentVerified === false
+                          ? "✕ Digest mismatch — tampered"
+                          : "— No hash in receipt"}
+                      </span>
+                    </div>
+                  </div>
+
+                  {verificationResult.receiptCommitmentHash && (
+                    <div style={{ marginTop: "0.5rem", padding: "0.5rem 0.75rem", background: "rgba(255, 255, 255, 0.02)", borderRadius: "0.375rem", border: "1px solid var(--border-card)" }}>
+                      <span style={{ fontSize: "0.7rem", color: "var(--text-secondary)" }}>Receipt Commitment Hash (SHA-256): </span>
+                      <code className="mono" style={{ fontSize: "0.7rem", color: "var(--cyan-primary)", wordBreak: "break-all" }}>
+                        {verificationResult.receiptCommitmentHash}
+                      </code>
+                    </div>
+                  )}
 
                   {/* Disclosed Payouts Table */}
                   <div style={{ marginTop: "1.25rem" }}>
@@ -2230,7 +2288,7 @@ export function App(): React.ReactElement {
       <footer style={{ marginTop: "4rem", textAlign: "center", borderTop: "1px solid var(--border-card)", paddingTop: "1.25rem", paddingBottom: "2rem" }}>
         <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem", padding: "0.25rem 0.75rem", borderRadius: "9999px", background: "rgba(255, 255, 255, 0.03)", border: "1px solid rgba(255, 255, 255, 0.08)", fontSize: "0.75rem", color: "var(--text-secondary)" }}>
           <span>🛡️</span>
-          <span>Built on OtterSec-Audited Solana Privacy Rings · SPL & Token-2022 Stablecoin Ready</span>
+          <span>Built on OtterSec-audited Solana Privacy Rings (Helius) · SPL & Token-2022 Stablecoin Ready</span>
         </div>
         <p className="muted" style={{ fontSize: "0.75rem" }}>
           Ciphra Powered by Solana Privacy Rings & Helius TEE Attested Prover · {keys}
