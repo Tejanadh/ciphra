@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { ShieldedAddress, ShieldedPublicKey, X25519PublicKey, bytes32 } from "@heliuslabs/spr/keypair";
 import { compareDecryptedAmounts, type AuditNote } from "../src/compare-decrypted-amounts.ts";
 
 const DECIMALS = 9;
@@ -7,15 +8,46 @@ const SENDER = "CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1";
 const SENDER_SHIELDED = "sender-shielded";
 const ALICE = "alice-shielded";
 const BOB = "bob-shielded";
-const FEE = "fee-collector-shielded";
 const ZERO_NOTES = "Zero on-chain notes were decrypted with this key.";
 
-function note(amount: bigint, role: AuditNote["role"], paddingProven?: boolean): AuditNote {
+function bytesToHex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** A real shielded address. The viewing key is what a decrypted sender slot exposes. */
+function person(id: number): { shielded: string; viewing: string } {
+  const seed = new Uint8Array(32);
+  seed[0] = id;
+  const viewing = new Uint8Array(33);
+  viewing[0] = 4;
+  viewing[1] = id;
+  const address = ShieldedAddress.fromPublicKeys(
+    ShieldedPublicKey.fromEd25519(bytes32(seed)),
+    bytes32(seed),
+    X25519PublicKey.fromBytes(viewing),
+  );
+  return {
+    shielded: bytesToHex(address.toBytes()),
+    viewing: bytesToHex(address.viewingPublicKey.toBytes()),
+  };
+}
+
+const alice = person(1);
+const bobPerson = person(2);
+const carol = person(3);
+const feePerson = person(4);
+
+function note(amount: bigint, role: AuditNote["role"], paddingProven?: boolean, recipientViewingKey?: string): AuditNote {
   return {
     amountBaseUnits: amount.toString(),
     role,
     ...(paddingProven === undefined ? {} : { paddingProven }),
+    ...(recipientViewingKey === undefined ? {} : { recipientViewingKey }),
   };
+}
+
+function paid(amount: bigint, who: { viewing: string }, role: AuditNote["role"] = "recipient", paddingProven?: boolean): AuditNote {
+  return note(amount, role, paddingProven, who.viewing);
 }
 
 function line(amount: bigint, shieldedAddress?: string): { amountBaseUnits: string; shieldedAddress?: string } {
@@ -60,8 +92,8 @@ test("2. a signature with decrypted notes and no claimed amounts is NOTHING_TO_V
 test("3. employer mode matches payouts exactly and refuses hidden outputs, count mismatches, and unproven zeros", () => {
   const verified = compareDecryptedAmounts(
     "employer",
-    [note(50n, "sender-change"), note(100n, "recipient"), note(200n, "recipient")],
-    [{ payouts: [line(100n, ALICE), line(200n, BOB)] }],
+    [note(50n, "sender-change"), paid(100n, alice), paid(200n, bobPerson)],
+    [{ payouts: [line(100n, alice.shielded), line(200n, bobPerson.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -69,8 +101,8 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 
   const hidden = compareDecryptedAmounts(
     "employer",
-    [note(100n, "recipient"), note(200n, "recipient"), note(300n, "recipient")],
-    [{ payouts: [line(100n, ALICE), line(200n, BOB)] }],
+    [paid(100n, alice), paid(200n, bobPerson), paid(300n, carol)],
+    [{ payouts: [line(100n, alice.shielded), line(200n, bobPerson.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -79,8 +111,8 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 
   const extraCount = compareDecryptedAmounts(
     "employer",
-    [note(100n, "recipient"), note(100n, "recipient")],
-    [{ payouts: [line(100n, ALICE)] }],
+    [paid(100n, alice), paid(100n, alice)],
+    [{ payouts: [line(100n, alice.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -89,8 +121,8 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 
   const missingCount = compareDecryptedAmounts(
     "employer",
-    [note(100n, "recipient")],
-    [{ payouts: [line(100n, ALICE), line(100n, BOB)] }],
+    [paid(100n, alice)],
+    [{ payouts: [line(100n, alice.shielded), line(100n, alice.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -99,8 +131,8 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 
   const provenPadding = compareDecryptedAmounts(
     "employer",
-    [note(0n, "recipient", true), note(100n, "recipient")],
-    [{ payouts: [line(100n, ALICE)] }],
+    [note(0n, "recipient", true), paid(100n, alice)],
+    [{ payouts: [line(100n, alice.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -108,8 +140,8 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 
   const unprovenZero = compareDecryptedAmounts(
     "employer",
-    [note(0n, "recipient"), note(100n, "recipient")],
-    [{ payouts: [line(100n, ALICE)] }],
+    [paid(0n, carol), paid(100n, alice)],
+    [{ payouts: [line(100n, alice.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -118,8 +150,8 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 
   const unknownOutput = compareDecryptedAmounts(
     "employer",
-    [note(100n, "recipient"), note(77n, "opened-note")],
-    [{ payouts: [line(100n, ALICE)] }],
+    [paid(100n, alice), paid(77n, carol, "opened-note")],
+    [{ payouts: [line(100n, alice.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -127,8 +159,8 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 
   const nonZeroPaddingFlag = compareDecryptedAmounts(
     "employer",
-    [note(100n, "recipient", true)],
-    [{ payouts: [line(100n, ALICE)] }],
+    [paid(100n, alice, "recipient", true)],
+    [{ payouts: [line(100n, alice.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -136,8 +168,8 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 
   const realZeroChange = compareDecryptedAmounts(
     "employer",
-    [note(0n, "sender-change"), note(100n, "recipient")],
-    [{ payouts: [line(100n, ALICE)] }],
+    [note(0n, "sender-change"), paid(100n, alice)],
+    [{ payouts: [line(100n, alice.shielded)] }],
     DECIMALS,
     employer,
   );
@@ -147,9 +179,9 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
 test("3b. a sender-owned protocol fee stays out of the multiset; a third-party fee must be named", () => {
   const selfFee = compareDecryptedAmounts(
     "employer",
-    [note(11n, "sender-change"), note(100n, "recipient")],
+    [note(11n, "sender-change"), paid(100n, alice)],
     [{
-      payouts: [line(100n, ALICE)],
+      payouts: [line(100n, alice.shielded)],
       protocolFee: { amountBaseUnits: "11", collector: SENDER },
     }],
     DECIMALS,
@@ -159,10 +191,10 @@ test("3b. a sender-owned protocol fee stays out of the multiset; a third-party f
 
   const thirdParty = compareDecryptedAmounts(
     "employer",
-    [note(100n, "recipient"), note(11n, "recipient")],
+    [paid(100n, alice), paid(11n, feePerson)],
     [{
-      payouts: [line(100n, ALICE)],
-      protocolFee: { amountBaseUnits: "11", shieldedAddress: FEE, collector: "OtherCollector" },
+      payouts: [line(100n, alice.shielded)],
+      protocolFee: { amountBaseUnits: "11", shieldedAddress: feePerson.shielded, collector: "OtherCollector" },
     }],
     DECIMALS,
     employer,
@@ -171,10 +203,10 @@ test("3b. a sender-owned protocol fee stays out of the multiset; a third-party f
 
   const thirdPartyHidden = compareDecryptedAmounts(
     "employer",
-    [note(100n, "recipient")],
+    [paid(100n, alice)],
     [{
-      payouts: [line(100n, ALICE)],
-      protocolFee: { amountBaseUnits: "11", shieldedAddress: FEE, collector: "OtherCollector" },
+      payouts: [line(100n, alice.shielded)],
+      protocolFee: { amountBaseUnits: "11", shieldedAddress: feePerson.shielded, collector: "OtherCollector" },
     }],
     DECIMALS,
     employer,
@@ -184,9 +216,9 @@ test("3b. a sender-owned protocol fee stays out of the multiset; a third-party f
 
   const unnamedFee = compareDecryptedAmounts(
     "employer",
-    [note(100n, "recipient"), note(11n, "recipient")],
+    [paid(100n, alice), paid(11n, feePerson)],
     [{
-      payouts: [line(100n, ALICE)],
+      payouts: [line(100n, alice.shielded)],
       protocolFee: { amountBaseUnits: "11", collector: "OtherCollector" },
     }],
     DECIMALS,
@@ -194,6 +226,78 @@ test("3b. a sender-owned protocol fee stays out of the multiset; a third-party f
   );
   assert.equal(unnamedFee.integrity, "UNSUPPORTED_RECEIPT");
   assert.match(unnamedFee.reason, /protocol fee has no shielded address/);
+
+  // Calling the fee sender-owned does not hide the note encrypted to someone else.
+  const falselySenderOwned = compareDecryptedAmounts(
+    "employer",
+    [paid(100n, alice), paid(11n, feePerson)],
+    [{
+      payouts: [line(100n, alice.shielded)],
+      protocolFee: { amountBaseUnits: "11", collector: SENDER },
+    }],
+    DECIMALS,
+    employer,
+  );
+  assert.equal(falselySenderOwned.integrity, "TAMPERED");
+  assert.equal(falselySenderOwned.reason, "An on-chain payout is missing from the receipt.");
+});
+
+test("3c. employer mode binds each amount to the recipient viewing key", () => {
+  const swapped = compareDecryptedAmounts(
+    "employer",
+    [paid(100n, alice), paid(200n, bobPerson)],
+    [{ payouts: [line(100n, bobPerson.shielded), line(200n, alice.shielded)] }],
+    DECIMALS,
+    employer,
+  );
+  assert.equal(swapped.integrity, "TAMPERED");
+  assert.equal(swapped.reason, "The receipt lists an amount that is not in the on-chain decrypted outputs.");
+
+  const paidToSomeoneElse = compareDecryptedAmounts(
+    "employer",
+    [paid(100n, carol)],
+    [{ payouts: [line(100n, alice.shielded)] }],
+    DECIMALS,
+    employer,
+  );
+  assert.equal(paidToSomeoneElse.integrity, "TAMPERED");
+  assert.notEqual(paidToSomeoneElse.integrity, "VERIFIED");
+});
+
+test("3d. an unreadable amount is unsupported, including a line that would otherwise be ignored", () => {
+  const extraGarbageLine = compareDecryptedAmounts(
+    "employer",
+    [paid(100n, alice)],
+    [{ payouts: [
+      { amountBaseUnits: "100", shieldedAddress: alice.shielded },
+      { amountBaseUnits: "12.5", shieldedAddress: bobPerson.shielded },
+    ] }],
+    DECIMALS,
+    employer,
+  );
+  assert.equal(extraGarbageLine.integrity, "UNSUPPORTED_RECEIPT");
+  assert.match(extraGarbageLine.reason, /amount could not be read/);
+  assert.notEqual(extraGarbageLine.integrity, "VERIFIED");
+
+  const notNothing = compareDecryptedAmounts(
+    "employer",
+    [paid(100n, alice)],
+    [{ payouts: [{ amount: "not-a-number", shieldedAddress: alice.shielded }] }],
+    DECIMALS,
+    employer,
+  );
+  assert.equal(notNothing.integrity, "UNSUPPORTED_RECEIPT");
+  assert.notEqual(notNothing.integrity, "NOTHING_TO_VERIFY");
+
+  const huge = "9007199254740993";
+  const precise = compareDecryptedAmounts(
+    "paystub",
+    [note(BigInt(huge), "opened-note")],
+    [{ payouts: [{ amountBaseUnits: huge, shieldedAddress: BOB }] }],
+    DECIMALS,
+    { paystubShieldedAddress: BOB },
+  );
+  assert.equal(precise.integrity, "VERIFIED");
 });
 
 test("4. paystub mode binds to this recipient and refuses receipts with no shielded address", () => {

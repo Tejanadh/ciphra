@@ -1,10 +1,16 @@
-import { parseAmount } from "@heliuslabs/spr";
+import { ShieldedAddress, X25519PublicKey } from "@heliuslabs/spr/keypair";
 
 export type AuditIntegrity = "VERIFIED" | "TAMPERED" | "FAILED" | "NOTHING_TO_VERIFY" | "UNSUPPORTED_RECEIPT";
 
 export interface AuditNote {
   readonly amountBaseUnits: string;
   readonly role: "recipient" | "sender-change" | "opened-note";
+  /**
+   * Hex of the X25519 viewing public key the slot was encrypted to.
+   * Employer mode pairs this with the amount. It is the viewing-key suffix of
+   * the recipient shielded address (`signing || nullifier || viewing`).
+   */
+  readonly recipientViewingKey?: string;
   /**
    * Set only when this zero-amount output was proven to be shape padding.
    * A zero note without this flag is a real output and stays in the comparison.
@@ -21,18 +27,24 @@ export interface CompareAuditContext {
   readonly senderShieldedAddress?: string;
 }
 
+const UNSUPPORTED_AMOUNT = "Unsupported receipt — an amount could not be read. Use an amountBaseUnits integer string.";
+
 /**
  * Check order, and it is the order the tests lock in:
  *  1. Zero decrypted notes return FAILED. This runs before the empty-receipt check,
  *     so an empty receipt plus zero notes is FAILED, not NOTHING_TO_VERIFY.
- *  2. Notes exist, but the receipt claims no payout amount and no positive fee.
+ *  2. A payout or fee row whose amount cannot be read is UNSUPPORTED_RECEIPT.
+ *     The row is not dropped. `amountBaseUnits` is read as an integer string.
+ *  3. Notes exist, but the receipt claims no payout amount and no positive fee.
  *     That is NOTHING_TO_VERIFY. VERIFIED requires a real match.
- *  3. Any payout line without a shielded address is UNSUPPORTED_RECEIPT.
+ *  4. Any payout line without a shielded address is UNSUPPORTED_RECEIPT.
  *     There is no amount-only fallback.
- *  4. Paystub mode binds to the verifying recipient's shielded address.
- *  5. Employer mode compares a multiset. Proven zero padding and sender-owned
- *     change (including a protocol fee paid back to the sender) are the only
- *     outputs left out. Every other decrypted output stays.
+ *  5. Paystub mode binds to the verifying recipient's shielded address.
+ *  6. Employer mode compares (viewing key, amount) pairs. The confidential
+ *     plaintext has no shielded address; the slot is encrypted to the
+ *     recipient viewing key, which is the suffix of that shielded address.
+ *     Proven zero padding and sender-owned change (including a protocol fee
+ *     paid back to the sender) are the only outputs left out.
  *
  * Fees are not one thing on chain.
  *
@@ -72,21 +84,19 @@ export function compareDecryptedAmounts(
     payoutRows.push(...rows);
     if (chunk?.protocolFee) feeRows.push(chunk.protocolFee);
   }
-  const payoutUnits = payoutRows.flatMap((row) => {
-    const units = claimedUnits(row, decimals);
-    return units === undefined ? [] : [units];
-  });
-  const feeUnits = feeRows.flatMap((row) => {
-    const units = claimedUnits(row, decimals);
-    return units === undefined || units === 0n ? [] : [units];
-  });
+  const payoutUnits = readClaimedUnits(payoutRows, decimals);
+  const feeUnits = readClaimedUnits(feeRows, decimals);
+  // 2. A row that exists but cannot be parsed is unsupported. It is not ignored.
+  if (payoutUnits === undefined || feeUnits === undefined) {
+    return { integrity: "UNSUPPORTED_RECEIPT", reason: UNSUPPORTED_AMOUNT };
+  }
 
-  // 2. A signature with no claimed amounts has notes, but nothing to check them against.
-  if (payoutUnits.length === 0 && feeUnits.length === 0) {
+  // 3. A signature with no claimed amounts has notes, but nothing to check them against.
+  if (payoutUnits.length === 0 && feeUnits.every((units) => units === 0n)) {
     return { integrity: "NOTHING_TO_VERIFY", reason: "Nothing to verify — on-chain notes decrypted only" };
   }
 
-  // 3. Amount-only matching of receipts that cannot name a shielded recipient is refused.
+  // 4. Amount-only matching of receipts that cannot name a shielded recipient is refused.
   if (payoutRows.some((row) => typeof row?.shieldedAddress !== "string" || row.shieldedAddress.trim() === "")) {
     return {
       integrity: "UNSUPPORTED_RECEIPT",
@@ -109,38 +119,63 @@ export function compareDecryptedAmounts(
         reason: "The recipient shielded address is missing from the receipt.",
       };
     }
-    const claimed = ownRows.flatMap((row) => {
-      const units = claimedUnits(row, decimals);
-      return units === undefined ? [] : [units];
-    });
+    const claimed = readClaimedUnits(ownRows, decimals);
+    if (claimed === undefined) {
+      return { integrity: "UNSUPPORTED_RECEIPT", reason: UNSUPPORTED_AMOUNT };
+    }
     const opened = comparableNotes(notes, "paystub").map((note) => BigInt(note.amountBaseUnits));
     return multisetVerdict(opened, claimed);
   }
 
-  const thirdPartyFees: bigint[] = [];
-  for (const fee of feeRows) {
-    const units = claimedUnits(fee, decimals);
+  const thirdPartyFees: { viewingKey: string; units: bigint }[] = [];
+  for (let index = 0; index < feeRows.length; index += 1) {
+    const fee = feeRows[index];
+    const units = feeUnits[index];
     if (units === undefined || units === 0n) continue;
     const ownedBySender = feeOwnedBySender(fee, context);
     if (ownedBySender === "yes") continue;
-    if (ownedBySender === "no") {
-      thirdPartyFees.push(units);
-      continue;
+    if (ownedBySender !== "no") {
+      return {
+        integrity: "UNSUPPORTED_RECEIPT",
+        reason: "Unsupported receipt — the protocol fee has no shielded address, so it cannot be separated from a pool charge.",
+      };
     }
-    return {
-      integrity: "UNSUPPORTED_RECEIPT",
-      reason: "Unsupported receipt — the protocol fee has no shielded address, so it cannot be separated from a pool charge.",
-    };
+    const viewingKey = viewingKeyFromShieldedAddress(fee?.shieldedAddress);
+    if (viewingKey === undefined) {
+      return {
+        integrity: "UNSUPPORTED_RECEIPT",
+        reason: "Unsupported receipt — the protocol fee shielded address does not identify a viewing key.",
+      };
+    }
+    thirdPartyFees.push({ viewingKey, units });
   }
 
-  const claimed = [
-    ...payoutRows.flatMap((row) => {
-      const units = claimedUnits(row, decimals);
-      return units === undefined ? [] : [units];
-    }),
-    ...thirdPartyFees,
-  ];
-  const onChain = comparableNotes(notes, "employer").map((note) => BigInt(note.amountBaseUnits));
+  const claimed: string[] = [];
+  for (let index = 0; index < payoutRows.length; index += 1) {
+    const units = payoutUnits[index];
+    if (units === undefined) return { integrity: "UNSUPPORTED_RECEIPT", reason: UNSUPPORTED_AMOUNT };
+    const viewingKey = viewingKeyFromShieldedAddress(payoutRows[index]?.shieldedAddress);
+    if (viewingKey === undefined) {
+      return {
+        integrity: "UNSUPPORTED_RECEIPT",
+        reason: "Unsupported receipt — a payout shielded address does not identify a viewing key.",
+      };
+    }
+    claimed.push(pairKey(viewingKey, units));
+  }
+  for (const fee of thirdPartyFees) claimed.push(pairKey(fee.viewingKey, fee.units));
+
+  const onChain: string[] = [];
+  for (const note of comparableNotes(notes, "employer")) {
+    const viewingKey = noteViewingKey(note);
+    if (viewingKey === undefined) {
+      return {
+        integrity: "UNSUPPORTED_RECEIPT",
+        reason: "Unsupported receipt — a decrypted output has no recipient viewing key, so it cannot be matched to a shielded address.",
+      };
+    }
+    onChain.push(pairKey(viewingKey, BigInt(note.amountBaseUnits)));
+  }
   return multisetVerdict(onChain, claimed);
 }
 
@@ -164,8 +199,12 @@ function comparableNotes(notes: readonly AuditNote[], mode: "paystub" | "employe
   });
 }
 
-function multisetVerdict(onChain: readonly bigint[], claimed: readonly bigint[]): { integrity: AuditIntegrity; reason: string } {
-  const check = subtractAmounts(onChain, claimed);
+function pairKey(viewingKey: string, units: bigint): string {
+  return `${viewingKey}:${units.toString()}`;
+}
+
+function multisetVerdict<T>(onChain: readonly T[], claimed: readonly T[]): { integrity: AuditIntegrity; reason: string } {
+  const check = subtractValues(onChain, claimed);
   if (check.missing.length === 0 && check.leftover.length === 0) {
     return { integrity: "VERIFIED", reason: "" };
   }
@@ -181,18 +220,87 @@ function multisetVerdict(onChain: readonly bigint[], claimed: readonly bigint[])
   };
 }
 
-function claimedUnits(value: { amountBaseUnits?: unknown; amount?: unknown; amountSol?: unknown }, decimals: number): bigint | undefined {
-  if (typeof value.amountBaseUnits === "string" && /^\d+$/.test(value.amountBaseUnits)) {
-    return BigInt(value.amountBaseUnits);
+/** Every row must parse. `undefined` means a row was present and unreadable. */
+function readClaimedUnits(rows: readonly any[], decimals: number): bigint[] | undefined {
+  const units: bigint[] = [];
+  for (const row of rows) {
+    const parsed = claimedUnits(row, decimals);
+    if (parsed === undefined) return undefined;
+    units.push(parsed);
   }
-  const amount = Number(value.amount ?? value.amountSol);
-  if (!Number.isFinite(amount) || amount < 0) return undefined;
-  return parseAmount(amount.toFixed(decimals), decimals);
+  return units;
 }
 
-function subtractAmounts(haystack: readonly bigint[], needles: readonly bigint[]): { missing: bigint[]; leftover: bigint[] } {
+/**
+ * `amountBaseUnits` wins, and it must be a base-10 integer string.
+ * A display `amount` is accepted only when it is a decimal string, or a number
+ * that round-trips through `toFixed` at this asset's scale.
+ */
+function claimedUnits(value: { amountBaseUnits?: unknown; amount?: unknown; amountSol?: unknown }, decimals: number): bigint | undefined {
+  if (value !== null && typeof value === "object" && "amountBaseUnits" in value && value.amountBaseUnits !== undefined && value.amountBaseUnits !== null) {
+    return typeof value.amountBaseUnits === "string" && /^\d+$/.test(value.amountBaseUnits)
+      ? BigInt(value.amountBaseUnits)
+      : undefined;
+  }
+  const amount = value?.amount ?? value?.amountSol;
+  if (typeof amount === "string") return parseDecimalUnits(amount, decimals);
+  if (typeof amount === "number") {
+    if (!Number.isFinite(amount) || amount < 0) return undefined;
+    const text = amount.toFixed(decimals);
+    if (Number(text) !== amount) return undefined;
+    return parseDecimalUnits(text, decimals);
+  }
+  return undefined;
+}
+
+function parseDecimalUnits(text: string, decimals: number): bigint | undefined {
+  const trimmed = text.trim();
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return undefined;
+  const [whole = "0", fraction = ""] = trimmed.split(".");
+  if (fraction.length > decimals) return undefined;
+  const padded = fraction.padEnd(decimals, "0");
+  const fractionUnits = padded === "" ? 0n : BigInt(padded);
+  return BigInt(whole) * 10n ** BigInt(decimals) + fractionUnits;
+}
+
+function viewingKeyFromShieldedAddress(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const bytes = hexToBytes(value.trim());
+  if (bytes === undefined) return undefined;
+  try {
+    return bytesToHex(ShieldedAddress.fromBytes(bytes).viewingPublicKey.toBytes());
+  } catch {
+    return undefined;
+  }
+}
+
+function noteViewingKey(note: AuditNote): string | undefined {
+  const bytes = note.recipientViewingKey === undefined ? undefined : hexToBytes(note.recipientViewingKey.trim());
+  if (bytes === undefined) return undefined;
+  try {
+    return bytesToHex(X25519PublicKey.fromBytes(bytes).toBytes());
+  } catch {
+    return undefined;
+  }
+}
+
+function hexToBytes(hex: string): Uint8Array | undefined {
+  const text = hex.toLowerCase();
+  if (text.length === 0 || text.length % 2 !== 0 || !/^[0-9a-f]+$/.test(text)) return undefined;
+  const bytes = new Uint8Array(text.length / 2);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(text.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function subtractValues<T>(haystack: readonly T[], needles: readonly T[]): { missing: T[]; leftover: T[] } {
   const left = [...haystack];
-  const missing: bigint[] = [];
+  const missing: T[] = [];
   for (const needle of needles) {
     const index = left.findIndex((value) => value === needle);
     if (index < 0) missing.push(needle);
