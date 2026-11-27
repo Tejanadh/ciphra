@@ -50,6 +50,7 @@ import {
   getBase58Decoder,
   getBase58Encoder,
   getSignatureFromTransaction,
+  assertIsTransactionWithBlockhashLifetime,
   isAddress,
   isKeyPairSigner,
   pipe,
@@ -448,8 +449,11 @@ export const actions = {
 };
 
 const PAYROLL_JOURNAL_STORAGE_KEY = "ciphra_payroll_journal";
-const JOURNAL_RETRY_AFTER_MS = 180_000;
 const MAX_JOURNAL_RUNS = 20;
+export const RECENT_PAYROLL_RUNS_KEY = "ciphra_recent_runs";
+export const LEGACY_RECENT_PAYROLL_RUNS_KEY = "veilpay_recent_runs";
+export const PERSIST_PAYROLL_HISTORY_KEY = "ciphra_persist_payroll_history";
+const STILL_IN_FLIGHT = "Transaction still in flight — wait for blockhash expiry";
 
 export type PayrollChunkStatus = "pending" | "submitted" | "confirmed" | "failed";
 
@@ -468,6 +472,10 @@ interface JournalChunk {
   status: PayrollChunkStatus;
   signature?: string;
   slot?: string;
+  /** Recent blockhash baked into the submitted transaction. Public. */
+  blockhash?: string;
+  /** Block height after which that blockhash can no longer land. Public. */
+  lastValidBlockHeight?: string;
   error?: string;
   submittedAt?: number;
 }
@@ -518,10 +526,12 @@ function readJournal(): JournalRun[] {
 
 function writeJournal(runs: readonly JournalRun[]): void {
   if (typeof localStorage === "undefined") return;
-  localStorage.setItem(
-    PAYROLL_JOURNAL_STORAGE_KEY,
-    JSON.stringify(runs.slice(0, MAX_JOURNAL_RUNS)),
-  );
+  const kept = runs.slice(0, MAX_JOURNAL_RUNS);
+  if (kept.length === 0) {
+    localStorage.removeItem(PAYROLL_JOURNAL_STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(PAYROLL_JOURNAL_STORAGE_KEY, JSON.stringify(kept));
 }
 
 function isJournalRun(value: unknown): value is JournalRun {
@@ -563,12 +573,20 @@ function notesToCover(wallet: Wallet, asset: Address, amount: bigint): WalletUtx
 async function submitAndIndex(
   session: Session,
   transaction: Transaction,
-  onSignature: (signature: string) => void,
+  onSignature: (
+    signature: string,
+    lifetime: { readonly blockhash: string; readonly lastValidBlockHeight: string },
+  ) => void,
 ): Promise<ExecutionResult> {
+  assertIsTransactionWithBlockhashLifetime(transaction);
+  const lifetime = {
+    blockhash: transaction.lifetimeConstraint.blockhash,
+    lastValidBlockHeight: transaction.lifetimeConstraint.lastValidBlockHeight.toString(),
+  };
   const { client, signer } = session;
   const signed = await signTransactionWithSigners([signer], transaction);
   const signature = getSignatureFromTransaction(signed);
-  onSignature(signature);
+  onSignature(signature, lifetime);
   await sendTransactionWithoutConfirmingFactory({ rpc: client.solanaRpc })(signed, {
     commitment: client.commitment,
   });
@@ -772,9 +790,106 @@ function chunkExecution(assetSymbol: AssetSymbol, decimals: number, chunk: Journ
 }
 
 /**
+ * One submitted signature is resent only when `getSignatureStatuses` is empty and the
+ * stored blockhash height has passed. A finished run is removed from the journal.
+ */
+function isInFlightJournal(run: JournalRun): boolean {
+  const hasSubmitted = run.chunks.some((chunk) => chunk.status === "submitted" && chunk.signature !== undefined);
+  const hasConfirmed = run.chunks.some((chunk) => chunk.status === "confirmed");
+  const hasUnfinished = run.chunks.some((chunk) => chunk.status !== "confirmed");
+  return hasSubmitted || (hasConfirmed && hasUnfinished);
+}
+
+/** Drops payroll receipts. Keeps a journal run that still has a submitted or partially confirmed chunk. */
+export function wipeLocalPayrollHistory(): { keptInFlightRuns: number } {
+  if (typeof localStorage === "undefined") return { keptInFlightRuns: 0 };
+  localStorage.removeItem(RECENT_PAYROLL_RUNS_KEY);
+  localStorage.removeItem(LEGACY_RECENT_PAYROLL_RUNS_KEY);
+  const kept = readJournal().filter(isInFlightJournal);
+  writeJournal(kept);
+  return { keptInFlightRuns: kept.length };
+}
+
+/**
+ * `getSignatureStatuses` plus block height. A clean confirmed or finalized signature is not resent.
+ * Rebuild only when the signature failed, or when it is absent and `currentBlockHeight > lastValidBlockHeight`.
+ */
+async function resumeSubmittedChunk(session: Session, chunk: JournalChunk): Promise<"confirmed" | "rebuild"> {
+  const signature = chunk.signature;
+  if (!signature || !chunk.blockhash || !chunk.lastValidBlockHeight) {
+    throw new Error(
+      `Batch ${chunk.index + 1} was submitted as ${signature ?? "(no signature)"} without a stored blockhash. It was not sent again.`,
+    );
+  }
+  let status: { confirmationStatus: string | null; err: unknown } | null;
+  try {
+    const response = await session.client.solanaRpc.getSignatureStatuses([signature as Signature], {
+      searchTransactionHistory: true,
+    }).send();
+    const entry = response.value[0] ?? null;
+    status = entry === null
+      ? null
+      : { confirmationStatus: entry.confirmationStatus, err: entry.err };
+  } catch (error) {
+    throw new Error(
+      `Could not read getSignatureStatuses for ${signature}. It was not sent again. ${errorText(error)}`,
+    );
+  }
+  const confirmation = status?.confirmationStatus ?? null;
+  const landedClean = status !== null
+    && status.err === null
+    && (confirmation === "confirmed" || confirmation === "finalized");
+  if (landedClean) {
+    try {
+      const settled = await readSettledTransaction(session, signature);
+      chunk.status = "confirmed";
+      chunk.slot = settled.slot;
+      delete chunk.error;
+      return "confirmed";
+    } catch (error) {
+      throw new Error(
+        `Batch ${chunk.index + 1} (${signature}) is ${confirmation ?? "confirmed"} with err === null, but the shielded-pool program was not verified. It was not sent again. ${errorText(error)}`,
+      );
+    }
+  }
+  if (status !== null && status.err !== null) {
+    chunk.status = "failed";
+    try {
+      chunk.error = JSON.stringify(status.err).slice(0, 500);
+    } catch {
+      chunk.error = "Submitted transaction failed on chain.";
+    }
+    return "rebuild";
+  }
+  let currentBlockHeight: bigint;
+  try {
+    currentBlockHeight = await session.client.solanaRpc.getBlockHeight({ commitment: "confirmed" }).send();
+  } catch (error) {
+    throw new Error(
+      `Could not read block height for ${signature}. It was not sent again. ${errorText(error)}`,
+    );
+  }
+  let expired = false;
+  try {
+    expired = status === null && currentBlockHeight > BigInt(chunk.lastValidBlockHeight);
+  } catch {
+    throw new Error(
+      `Batch ${chunk.index + 1} has an unreadable lastValidBlockHeight. It was not sent again.`,
+    );
+  }
+  if (expired) {
+    chunk.status = "failed";
+    chunk.error = "Submitted transaction was absent after its blockhash expired.";
+    return "rebuild";
+  }
+  chunk.error = STILL_IN_FLIGHT;
+  throw new Error(STILL_IN_FLIGHT);
+}
+
+/**
  * Executes batch payroll using buildMultiTransferTransaction.
  * Max 14 recipients per chunk to leave the 15th slot for the 0.25% protocol fee.
- * A journal written before the first send skips chunks already confirmed on chain.
+ * The journal is written before the first send and deleted once every chunk is confirmed.
  */
 export async function runBatchPayroll(
   session: Session,
@@ -896,27 +1011,20 @@ export async function runBatchPayroll(
     }
 
     if (chunk.status === "submitted" && chunk.signature) {
-      const age = Date.now() - (chunk.submittedAt ?? journal.createdAt);
+      let decision: "confirmed" | "rebuild";
       try {
-        const settled = await readSettledTransaction(session, chunk.signature);
-        chunk.status = "confirmed";
-        chunk.slot = settled.slot;
+        decision = await resumeSubmittedChunk(session, chunk);
+      } catch (error) {
         persist();
+        throw error;
+      }
+      persist();
+      if (decision === "confirmed") {
         onProgress?.(`Batch ${chunk.index + 1} was already confirmed. Skipping it.`);
         executed.push(chunkExecution(assetSymbol, decimals, chunk));
         continue;
-      } catch (error) {
-        if (age < JOURNAL_RETRY_AFTER_MS) {
-          chunk.error = errorText(error);
-          persist();
-          throw new Error(
-            `Batch ${chunk.index + 1} was submitted as ${chunk.signature} and is not confirmed. It was not sent again. Resume after it lands or expires.`,
-          );
-        }
-        chunk.status = "failed";
-        chunk.error = errorText(error);
-        persist();
       }
+      onProgress?.(`Batch ${chunk.index + 1} did not land and its blockhash expired. Building a replacement.`);
     }
 
     if (chunk.index > 0 && antiCorrelationJitter) {
@@ -957,9 +1065,11 @@ export async function runBatchPayroll(
         payments,
         ...(mint === SOL_MINT ? {} : { asset: mint }),
       });
-      const result = await submitAndIndex(session, transaction, (signature) => {
+      const result = await submitAndIndex(session, transaction, (signature, lifetime) => {
         chunk.status = "submitted";
         chunk.signature = signature;
+        chunk.blockhash = lifetime.blockhash;
+        chunk.lastValidBlockHeight = lifetime.lastValidBlockHeight;
         chunk.submittedAt = Date.now();
         delete chunk.error;
         persist();
@@ -978,6 +1088,10 @@ export async function runBatchPayroll(
       persist();
       throw error;
     }
+  }
+
+  if (journal.chunks.every((chunk) => chunk.status === "confirmed")) {
+    writeJournal(readJournal().filter((run) => run.runId !== journal.runId));
   }
 
   const totalFeeNum = Number(totalFeeBaseUnits) / 10 ** decimals;

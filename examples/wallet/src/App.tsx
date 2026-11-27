@@ -35,7 +35,10 @@ import {
   openSession,
   exportBatchTransactionViewingKey,
   parseViewingKeyBytes,
+  PERSIST_PAYROLL_HISTORY_KEY,
+  RECENT_PAYROLL_RUNS_KEY,
   runBatchPayroll,
+  wipeLocalPayrollHistory,
   snapshot,
   verifyAuditReceipt,
   type VerifyAuditMode,
@@ -270,10 +273,19 @@ export function App(): React.ReactElement {
   const [showCsvModal, setShowCsvModal] = useState(false);
   const [csvInput, setCsvInput] = useState("");
   const [payrollProgress, setPayrollProgress] = useState("");
+  const [persistPayrollHistory, setPersistPayrollHistory] = useState(() => {
+    try {
+      return localStorage.getItem(PERSIST_PAYROLL_HISTORY_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [historyNotice, setHistoryNotice] = useState("");
   const [recentPayrollRuns, setRecentPayrollRuns] = useState<BatchPayrollReport[]>(() => {
     try {
-      const stored = localStorage.getItem("ciphra_recent_runs") || localStorage.getItem("veilpay_recent_runs");
-      return stored ? JSON.parse(stored) : [];
+      if (localStorage.getItem(PERSIST_PAYROLL_HISTORY_KEY) !== "1") return [];
+      const stored = localStorage.getItem(RECENT_PAYROLL_RUNS_KEY);
+      return stored ? JSON.parse(stored) as BatchPayrollReport[] : [];
     } catch {
       return [];
     }
@@ -350,6 +362,16 @@ export function App(): React.ReactElement {
     // Initial scan of sample treasury for instant interactive visual
     void handleScanExposure(SAMPLE_DAO_TREASURY);
   }, []);
+
+  useEffect(() => {
+    if (persistPayrollHistory) return;
+    try {
+      localStorage.removeItem(RECENT_PAYROLL_RUNS_KEY);
+      localStorage.removeItem("veilpay_recent_runs");
+    } catch {
+      // Storage can be unavailable in a locked-down browser.
+    }
+  }, [persistPayrollHistory]);
 
   const current = useRef<Activity | undefined>(undefined);
   const nextId = useRef(1);
@@ -497,10 +519,12 @@ export function App(): React.ReactElement {
       // Attach tamper-evident SHA-256 commitment hash & Ed25519 signature to the report
       const reportWithHash = await attachCommitmentHashes(session, report);
 
-      // Store run report
+      // Receipts stay in memory unless the employer opts in. Amounts are not written by default.
       const updatedRuns = [reportWithHash, ...recentPayrollRuns].slice(0, 20);
       setRecentPayrollRuns(updatedRuns);
-      localStorage.setItem("ciphra_recent_runs", JSON.stringify(updatedRuns));
+      if (persistPayrollHistory) {
+        localStorage.setItem(RECENT_PAYROLL_RUNS_KEY, JSON.stringify(updatedRuns));
+      }
 
       // Refresh snapshot
       const lastSlotStr = report.chunks[report.chunks.length - 1]?.slot;
@@ -1514,10 +1538,53 @@ export function App(): React.ReactElement {
 
               {/* Recent Payroll Runs (Audit Ledger) */}
               <div className="card-specular table-panel">
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem", gap: "0.75rem", flexWrap: "wrap" }}>
                   <h3 style={{ fontSize: "1.05rem", fontWeight: 700 }}>Recent Payroll Runs (Audit Ledger)</h3>
-                  <span className="muted" style={{ fontSize: "0.75rem" }}>{recentPayrollRuns.length} recorded</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.75rem" }}>
+                      <input
+                        type="checkbox"
+                        checked={persistPayrollHistory}
+                        onChange={(event) => {
+                          const enabled = event.target.checked;
+                          setPersistPayrollHistory(enabled);
+                          if (enabled) {
+                            localStorage.setItem(PERSIST_PAYROLL_HISTORY_KEY, "1");
+                            localStorage.setItem(RECENT_PAYROLL_RUNS_KEY, JSON.stringify(recentPayrollRuns));
+                            setHistoryNotice("Payroll receipts will stay in this browser until you wipe them.");
+                          } else {
+                            localStorage.removeItem(PERSIST_PAYROLL_HISTORY_KEY);
+                            localStorage.removeItem(RECENT_PAYROLL_RUNS_KEY);
+                            localStorage.removeItem("veilpay_recent_runs");
+                            setHistoryNotice("Payroll receipts stay in this tab only.");
+                          }
+                        }}
+                      />
+                      Keep receipts in this browser
+                    </label>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      type="button"
+                      onClick={() => {
+                        const { keptInFlightRuns } = wipeLocalPayrollHistory();
+                        localStorage.removeItem(PERSIST_PAYROLL_HISTORY_KEY);
+                        setPersistPayrollHistory(false);
+                        setRecentPayrollRuns([]);
+                        setHistoryNotice(
+                          keptInFlightRuns > 0
+                            ? `Wiped local payroll history. ${keptInFlightRuns} in-flight journal run${keptInFlightRuns === 1 ? "" : "s"} kept so a submitted transaction is not sent twice.`
+                            : "Wiped local payroll history.",
+                        );
+                      }}
+                    >
+                      Wipe Local History
+                    </button>
+                    <span className="muted" style={{ fontSize: "0.75rem" }}>{recentPayrollRuns.length} in this session</span>
+                  </div>
                 </div>
+                {historyNotice && (
+                  <p className="muted" style={{ fontSize: "0.75rem", marginBottom: "0.75rem" }}>{historyNotice}</p>
+                )}
 
                 {recentPayrollRuns.length === 0 ? (
                   <p className="muted" style={{ fontSize: "0.85rem", textAlign: "center", padding: "2rem" }}>
@@ -1705,9 +1772,14 @@ export function App(): React.ReactElement {
               </div>
               <p className="muted" style={{ fontSize: "0.78rem", marginBottom: "0.75rem" }}>
                 {verifyMode === "paystub"
-                  ? "Paystub mode calls decryptUtxo on the recipient viewing key. It opens only the note encrypted to that key. Other recipients and sender change stay closed."
+                  ? "Paystub mode calls decryptUtxo on the recipient viewing key. That call opens this note. The same 32-byte ViewingKey also opens every other note encrypted to this wallet."
                   : "Batch audit derives transactionViewingKey(firstNullifier) and calls decryptSlotEphemeral on every slot. That opens sender change and every recipient."}
               </p>
+              {verifyMode === "paystub" && (
+                <div style={{ background: "rgba(245, 158, 11, 0.12)", border: "1px solid rgba(245, 158, 11, 0.45)", padding: "0.75rem 1rem", borderRadius: "0.5rem", color: "#FCD34D", fontSize: "0.8rem", marginBottom: "0.75rem" }}>
+                  Your 32-byte ViewingKey opens ALL incoming notes to your wallet—only use it in your own browser; never paste it on a third party's device.
+                </div>
+              )}
               {verifyMode === "employer" && (
                 <label style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start", fontSize: "0.78rem", marginBottom: "0.75rem" }}>
                   <input

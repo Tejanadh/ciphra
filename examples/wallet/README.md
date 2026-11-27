@@ -16,7 +16,7 @@ Standard Solana transfers broadcast every payer, recipient, and transfer amount 
 2. **Team Salary Hierarchy**: Exact compensation differences between senior engineers, auditors, and executives.
 3. **Temporal Payout Clustering**: Predictable monthly or bi-weekly disbursement dates that correlate on-chain addresses directly with specific team members.
 
-Payroll runs call `buildMultiTransferTransaction` (1 to 15 payments). Optional timing jitter spaces chunks. A `ciphra_payroll_journal` record is written before the first send and skips chunks already confirmed on chain. `/verify` decrypts indexed notes: recipient `decryptUtxo` for one paystub, or the sender `transactionViewingKey` and `decryptSlotEphemeral` for a full batch.
+Payroll runs call `buildMultiTransferTransaction` (1 to 15 payments). Optional timing jitter spaces chunks. A `ciphra_payroll_journal` record is written before the first send, stores the public blockhash and `lastValidBlockHeight`, and is deleted once every chunk is confirmed. A submitted signature is resent only when `getSignatureStatuses` is empty and the block height has passed `lastValidBlockHeight`. `/verify` decrypts indexed notes: recipient `decryptUtxo` for one paystub, or the sender `transactionViewingKey` and `decryptSlotEphemeral` for a full batch. The recipient `ViewingKey` opens every note encrypted to that key.
 
 ---
 
