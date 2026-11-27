@@ -385,12 +385,6 @@ export function App(): React.ReactElement {
       .then(async (opened) => {
         if (cancelled) return;
         setSession(opened);
-        void opened.prover
-          .prefetch({ shapes: [shapeByLabel("1x2"), shapeByLabel("2x2")], onProgress: (update: KeyProgress) => setKeys(keyStatus(update)) })
-          .then(
-            () => setKeys("Proving keys ready"),
-            () => setKeys("Proving keys load on first use"),
-          );
         setState(await snapshot(opened));
       })
       .catch((cause: unknown) => setError(String(cause)));
@@ -398,6 +392,25 @@ export function App(): React.ReactElement {
       cancelled = true;
     };
   }, [onMeasurement, sessionEpoch, viewMode]);
+
+  useEffect(() => {
+    if (session === undefined || activeTab !== "payroll") return;
+    let cancelled = false;
+    const handle = window.setTimeout(() => {
+      void session.prover
+        .prefetch({ shapes: [shapeByLabel("1x2"), shapeByLabel("2x2")], onProgress: (update: KeyProgress) => {
+          if (!cancelled) setKeys(keyStatus(update));
+        } })
+        .then(
+          () => { if (!cancelled) setKeys("Proving keys ready"); },
+          () => { if (!cancelled) setKeys("Proving keys load on first use"); },
+        );
+    }, 700);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [session, activeTab]);
 
   const run = async (label: string, action: (s: Session) => Promise<bigint | ExecutionResult | undefined>) => {
     if (session === undefined || busy) return;
@@ -537,7 +550,11 @@ export function App(): React.ReactElement {
 
   // Verify Audit Receipt
   const handleVerifyReceipt = async () => {
-    if (!session || !receiptInput.trim()) return;
+    if (!receiptInput.trim()) return;
+    if (!session) {
+      setVerificationError("This browser is still connecting. The form is ready — decrypt again in a moment.");
+      return;
+    }
     if (verifyMode === "employer" && !employerWarned) {
       setVerificationError("Confirm the employer warning first. That key opens change and every recipient output.");
       return;
@@ -970,6 +987,336 @@ export function App(): React.ReactElement {
         </section>
         </>;
 
+  const verifyView = (
+            <div className="card-specular table-panel page-enter">
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1.25rem", flexWrap: "wrap", gap: "0.5rem" }}>
+                <div>
+                  <h2 style={{ fontSize: "1.15rem", fontWeight: 700, marginBottom: "0.25rem" }}>
+                    Selective Cryptographic Audit Verifier
+                  </h2>
+                  <p className="muted" style={{ fontSize: "0.8rem" }}>
+                    Amounts come from decrypting the indexed ciphertext. A pasted receipt is only a cross-check.
+                  </p>
+                </div>
+
+                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => setReceiptInput(JSON.stringify(SAMPLE_AUDIT_RECEIPT, null, 2))}
+                    title="Load a verified sample audit receipt from Devnet"
+                  >
+                    ⚡ Load Demo Audit Receipt
+                  </button>
+                  {recentPayrollRuns.length > 0 && (
+                    <button
+                      className="btn btn-outline-emerald btn-sm"
+                      onClick={() => setReceiptInput(JSON.stringify(recentPayrollRuns[0], null, 2))}
+                    >
+                      📄 Paste Latest Run Receipt
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem", flexWrap: "wrap" }}>
+                <button
+                  className={`btn btn-sm ${verifyMode === "paystub" ? "btn-primary" : "btn-secondary"}`}
+                  onClick={() => setVerifyMode("paystub")}
+                  type="button"
+                >
+                  Single-recipient paystub
+                </button>
+                <button
+                  className={`btn btn-sm ${verifyMode === "employer" ? "btn-primary" : "btn-secondary"}`}
+                  onClick={() => setVerifyMode("employer")}
+                  type="button"
+                >
+                  Employer / CPA batch audit
+                </button>
+              </div>
+              <p className="muted" style={{ fontSize: "0.78rem", marginBottom: "0.75rem" }}>
+                {verifyMode === "paystub"
+                  ? "Paystub mode calls decryptUtxo on the recipient viewing key. That call opens this note. The same 32-byte ViewingKey also opens every other note encrypted to this wallet."
+                  : "Batch audit derives transactionViewingKey(firstNullifier) and calls decryptSlotEphemeral on every slot. That opens sender change and every recipient."}
+              </p>
+              {verifyMode === "paystub" && (
+                <div style={{ background: "rgba(245, 158, 11, 0.12)", border: "1px solid rgba(245, 158, 11, 0.45)", padding: "0.75rem 1rem", borderRadius: "0.5rem", color: "#FCD34D", fontSize: "0.8rem", marginBottom: "0.75rem" }}>
+                  Your 32-byte ViewingKey opens ALL incoming notes to your wallet—only use it in your own browser; never paste it on a third party's device.
+                </div>
+              )}
+              {verifyMode === "employer" && (
+                <label style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start", fontSize: "0.78rem", marginBottom: "0.75rem" }}>
+                  <input
+                    type="checkbox"
+                    checked={employerWarned}
+                    onChange={(event) => setEmployerWarned(event.target.checked)}
+                  />
+                  <span>
+                    I understand this transaction viewing key reveals change and every recipient in the batch. It is not a single-contractor paystub.
+                  </span>
+                </label>
+              )}
+              <label style={{ display: "flex", gap: "0.5rem", alignItems: "center", fontSize: "0.78rem", marginBottom: "0.5rem" }}>
+                <input
+                  type="checkbox"
+                  checked={useConnectedKey}
+                  onChange={(event) => setUseConnectedKey(event.target.checked)}
+                />
+                Use the connected wallet. The viewing key is not written to Local Storage.
+              </label>
+              {!useConnectedKey && (
+                <textarea
+                  className="csv-textarea"
+                  placeholder="32-byte viewing key, hex or base58. Not the 64-byte ed25519 derivation signature."
+                  value={viewingKeyInput}
+                  onChange={(event) => setViewingKeyInput(event.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                  style={{ height: "4.5rem", marginBottom: "0.75rem" }}
+                />
+              )}
+              <textarea
+                className="csv-textarea"
+                placeholder="Paste a transaction signature, or a Ciphra receipt JSON. Receipt amounts are checked against the decrypted notes."
+                value={receiptInput}
+                onChange={(e) => setReceiptInput(e.target.value)}
+                style={{ height: "8.5rem", marginBottom: "1rem" }}
+              />
+
+              <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.5rem", flexWrap: "wrap" }}>
+                <button
+                  className="btn btn-primary"
+                  disabled={verifying || !receiptInput.trim() || (!useConnectedKey && !viewingKeyInput.trim())}
+                  onClick={handleVerifyReceipt}
+                >
+                  {verifying ? "Decrypting indexed notes…" : "Decrypt and verify on-chain"}
+                </button>
+                {verifyMode === "employer" && (
+                  <button
+                    className="btn btn-secondary"
+                    type="button"
+                    disabled={!employerWarned || !receiptInput.trim()}
+                    onClick={handleExportTransactionViewingKey}
+                  >
+                    {copiedText === "tx-viewing-key" ? "Copied transaction viewing key" : "Export batch transaction viewing key"}
+                  </button>
+                )}
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    setReceiptInput("");
+                    setVerificationResult(null);
+                    setVerificationError("");
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
+
+              {verificationError && (
+                <div style={{ background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.3)", padding: "0.75rem 1rem", borderRadius: "0.5rem", color: "#FCA5A5", fontSize: "0.85rem", marginBottom: "1.5rem" }}>
+                  Verification Failed: {verificationError}
+                </div>
+              )}
+
+              {/* Holographic Verified Certificate Card */}
+              {verificationResult && (
+                <div className="holographic-cert">
+                  <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem", padding: "0.25rem 0.65rem", borderRadius: "9999px", background: verificationResult.integrity === "VERIFIED" ? "rgba(16, 185, 129, 0.15)" : verificationResult.integrity === "NOTHING_TO_VERIFY" ? "rgba(245, 158, 11, 0.15)" : "rgba(239, 68, 68, 0.15)", border: `1px solid ${verificationResult.integrity === "VERIFIED" ? "rgba(16, 185, 129, 0.4)" : verificationResult.integrity === "NOTHING_TO_VERIFY" ? "rgba(245, 158, 11, 0.45)" : "rgba(239, 68, 68, 0.4)"}`, color: verificationResult.integrity === "VERIFIED" ? "#34D399" : verificationResult.integrity === "NOTHING_TO_VERIFY" ? "#FCD34D" : "#FCA5A5", fontSize: "0.75rem", fontWeight: 700, marginBottom: "0.75rem", flexWrap: "wrap" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.35rem" }}>
+                      <span>🛡️</span>
+                      <span>{verificationResult.integrity === "TAMPERED"
+                        ? "TAMPERED — RECEIPT ≠ DECRYPTED NOTES"
+                        : verificationResult.integrity === "NOTHING_TO_VERIFY"
+                          ? "Nothing to verify — on-chain notes decrypted only"
+                          : verificationResult.integrity === "FAILED"
+                            ? "FAILED — Zero on-chain notes were decrypted with this key."
+                            : verificationResult.integrity === "UNSUPPORTED_RECEIPT"
+                              ? "Unsupported receipt — payout lines have no shielded address"
+                              : "DECRYPTED FROM THE INDEXED TRANSACTION"}</span>
+                    </div>
+                    {verificationResult.payerSignatureVerified && (
+                      <span style={{ paddingLeft: "0.5rem", borderLeft: "1px solid rgba(16, 185, 129, 0.4)", color: "#10B981" }}>
+                        ✓ Ed25519 Payer Authenticated
+                      </span>
+                    )}
+                  </div>
+
+                  <h3 style={{ fontSize: "1.35rem", fontWeight: 800, marginBottom: "0.25rem" }}>
+                    Ciphra Zero-Knowledge Audit Certificate
+                  </h3>
+                  <p className="muted" style={{ fontSize: "0.825rem", marginBottom: "1.5rem" }}>
+                    Verified On-Chain Execution & Tamper-Evident Receipt Binding. Transaction confirmed against Solana Privacy Rings & Helius Devnet RPC.
+                  </p>
+
+                  <div className="cert-meta-grid">
+                    <div className="cert-meta-item">
+                      <span className="cert-meta-label">On-Chain Tx Signature</span>
+                      <a
+                        href={`https://solscan.io/tx/${verificationResult.txSignature}?cluster=devnet`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mono"
+                        style={{ color: "var(--cyan-primary)", fontSize: "0.85rem", textDecoration: "none" }}
+                      >
+                        {verificationResult.txSignature.slice(0, 16)}…{verificationResult.txSignature.slice(-8)} ↗
+                      </a>
+                    </div>
+
+                    <div className="cert-meta-item">
+                      <span className="cert-meta-label">Landed Block Slot</span>
+                      <span className="cert-meta-val">#{verificationResult.slot}</span>
+                    </div>
+
+                    <div className="cert-meta-item">
+                      <span className="cert-meta-label">Disbursed Currency / Asset</span>
+                      <span className="cert-meta-val" style={{ color: verificationResult.asset === "USDC" ? "#60A5FA" : "#34D399", fontWeight: 700 }}>
+                        {verificationResult.asset || "SOL"} ({verificationResult.decimals ?? (verificationResult.asset === "USDC" ? 6 : 9)} decimals)
+                      </span>
+                    </div>
+
+                    <div className="cert-meta-item">
+                      <span className="cert-meta-label">Total Verified Disbursement</span>
+                      <span className="cert-meta-val" style={{ color: verificationResult.asset === "USDC" ? "#60A5FA" : "#34D399", fontWeight: 700 }}>
+                        {formatSol(verificationResult.totalDisclosed ?? verificationResult.totalDisclosedSol)} {verificationResult.asset || "SOL"}
+                      </span>
+                    </div>
+
+                    <div className="cert-meta-item">
+                      <span className="cert-meta-label">Privacy Ring Program</span>
+                      <span className="cert-meta-val" style={{ fontSize: "0.8rem" }}>
+                        {verificationResult.ringProgramId}
+                      </span>
+                    </div>
+
+                    <div className="cert-meta-item">
+                      <span className="cert-meta-label">Attesting Payer Wallet</span>
+                      <span className="cert-meta-val mono" style={{ fontSize: "0.85rem" }}>
+                        {verificationResult.payerPubkey
+                          ? `${verificationResult.payerPubkey.slice(0, 6)}…${verificationResult.payerPubkey.slice(-6)}`
+                          : "—"}
+                      </span>
+                    </div>
+
+                    <div className="cert-meta-item">
+                      <span className="cert-meta-label">Protocol Fee (0.25%)</span>
+                      <span className="cert-meta-val" style={{ fontSize: "0.85rem" }}>
+                        {verificationResult.protocolFee
+                          ? `${formatSol(verificationResult.protocolFee.amount ?? verificationResult.protocolFee.amountSol ?? 0)} ${verificationResult.asset || "SOL"}`
+                          : "—"}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Integrity Verification Checks */}
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0.5rem", marginTop: "1rem", padding: "0.75rem", background: "rgba(255, 255, 255, 0.02)", borderRadius: "0.5rem", border: "1px solid var(--border-card)" }}>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>On-Chain Tx Success: </span>
+                      <span style={{ color: verificationResult.txSuccessConfirmed ? "#34D399" : "#F87171", fontWeight: 600 }}>
+                        {verificationResult.txSuccessConfirmed ? "✓ meta.err === null" : "✕ Failed"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>Slot Match: </span>
+                      <span style={{ color: verificationResult.onChainSlotMatch ? "#34D399" : "#FBBF24", fontWeight: 600 }}>
+                        {verificationResult.onChainSlotMatch ? "✓ Confirmed" : "⚠ Mismatch"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>Privacy Rings Program: </span>
+                      <span style={{ color: verificationResult.programInvocationConfirmed ? "#34D399" : "#FBBF24", fontWeight: 600 }}>
+                        {verificationResult.programInvocationConfirmed ? "✓ ring1GaLC…XANW" : "— Not verified"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>SHA-256 Commitment: </span>
+                      <span style={{ color: verificationResult.commitmentVerified === true ? "#34D399" : verificationResult.commitmentVerified === false ? "#F87171" : "var(--text-muted)", fontWeight: 600 }}>
+                        {verificationResult.commitmentVerified === true
+                          ? "✓ Tamper-evident digest matches"
+                          : verificationResult.commitmentVerified === false
+                          ? "✕ Digest mismatch — tampered"
+                          : "— No hash in receipt"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.775rem" }}>
+                      <span style={{ color: "var(--text-secondary)" }}>Ed25519 Payer Signature: </span>
+                      <span style={{ color: verificationResult.payerSignatureVerified ? "#34D399" : "#F87171", fontWeight: 600 }}>
+                        {verificationResult.payerSignatureVerified
+                          ? `✓ Authenticated (${verificationResult.payerPubkey?.slice(0, 4)}…${verificationResult.payerPubkey?.slice(-4)})`
+                          : "✕ Unverified Signature"}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Institutional Attestation Clarification */}
+                  <div style={{ marginTop: "0.75rem", padding: "0.6rem 0.85rem", background: "rgba(16, 185, 129, 0.05)", border: "1px solid rgba(16, 185, 129, 0.2)", borderRadius: "0.375rem" }}>
+                    <p style={{ fontSize: "0.775rem", margin: 0, color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                      <strong style={{ color: "#34D399" }}>Institutional Attestation Notice:</strong> Disclosed payout amounts, recipient addresses, and block slots are cryptographically bound and attested by the payer's Ed25519 digital signature, while shielded company treasury balances remain zero-knowledge encrypted on Solana Privacy Rings.
+                    </p>
+                  </div>
+
+                  {verificationResult.receiptCommitmentHash && (
+                    <div style={{ marginTop: "0.5rem", padding: "0.5rem 0.75rem", background: "rgba(255, 255, 255, 0.02)", borderRadius: "0.375rem", border: "1px solid var(--border-card)" }}>
+                      <span style={{ fontSize: "0.7rem", color: "var(--text-secondary)" }}>Receipt Commitment Hash (SHA-256): </span>
+                      <code className="mono" style={{ fontSize: "0.7rem", color: "var(--cyan-primary)", wordBreak: "break-all" }}>
+                        {verificationResult.receiptCommitmentHash}
+                      </code>
+                    </div>
+                  )}
+
+                  {/* Disclosed Payouts Table */}
+                  <div style={{ marginTop: "1.25rem" }}>
+                    <h4 style={{ fontSize: "0.9rem", fontWeight: 600, marginBottom: "0.5rem" }}>
+                    On-chain decrypted outputs ({verificationResult.integrity})
+                  </h4>
+                  {verificationResult.integrity !== "VERIFIED" && verificationResult.tamperReason && (
+                    <p style={{ color: verificationResult.integrity === "NOTHING_TO_VERIFY" ? "#FCD34D" : "#FCA5A5", fontSize: "0.8rem" }}>{verificationResult.tamperReason}</p>
+                  )}
+                    <div className="payroll-table-wrap">
+                      <table className="payroll-table">
+                        <thead>
+                          <tr>
+                            <th>Slot</th>
+                            <th>Role</th>
+                            <th>Mint</th>
+                            <th>Amount</th>
+                            <th>Viewing key</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {verificationResult.decryptedOutputs.map((note) => (
+                            <tr key={`${note.signature}-${note.slotIndex}`}>
+                              <td className="mono">{note.slotIndex}</td>
+                              <td>{note.role}</td>
+                              <td className="mono" style={{ fontSize: "0.75rem" }}>{note.mint}</td>
+                              <td className="mono" style={{ fontWeight: 600 }}>{note.amountDisplay}</td>
+                              <td className="mono" style={{ fontSize: "0.75rem" }}>{note.recipientViewingKey.slice(0, 12)}…</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", gap: "0.5rem", marginTop: "1.5rem" }}>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => copyToClipboard(verificationResult.txSignature, "hash")}
+                    >
+                      {copiedText === "hash" ? "Copied Hash!" : "📋 Copy Verification Hash"}
+                    </button>
+                    <button
+                      className="btn btn-outline-emerald btn-sm"
+                      onClick={() => downloadJson(`ciphra-certificate-${verificationResult.txSignature.slice(0, 8)}.json`, verificationResult)}
+                    >
+                      ⬇️ Download Certificate JSON
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+  );
+
   // Loading state
   if (session === undefined || state === undefined) {
     return (
@@ -991,8 +1338,17 @@ export function App(): React.ReactElement {
             </button>
           </div>
         </header>
-        {viewMode === "landing" ? landingView : (
-        <div className="card-specular" style={{ textAlign: "center", padding: "4rem 2rem", margin: "3rem auto", maxWidth: "42rem" }}>
+        {viewMode === "landing" ? landingView : activeTab === "verify" ? (
+        <section className="page-enter">
+          <div className="workspace-tabs">
+            <button className="workspace-tab" type="button" onClick={() => setActiveTab("payroll")}>Payroll</button>
+            <button className="workspace-tab active" type="button">Verify</button>
+          </div>
+          <p className="connect-line">{error === "" ? "Opening the verifier. The wallet connects behind this form." : error}</p>
+          {verifyView}
+        </section>
+        ) : (
+        <div className="card-specular page-enter" style={{ textAlign: "center", padding: "4rem 2rem", margin: "3rem auto", maxWidth: "42rem" }}>
           {error === "" ? (
             <>
               <div className="spinner" style={{ margin: "0 auto 1.5rem", width: "2.5rem", height: "2.5rem" }} />
@@ -1730,327 +2086,7 @@ export function App(): React.ReactElement {
           )}
 
           {/* TAB 3: AUDIT VERIFIER */}
-          {activeTab === "verify" && (
-            <div className="card-specular table-panel">
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1.25rem", flexWrap: "wrap", gap: "0.5rem" }}>
-                <div>
-                  <h2 style={{ fontSize: "1.15rem", fontWeight: 700, marginBottom: "0.25rem" }}>
-                    Selective Cryptographic Audit Verifier
-                  </h2>
-                  <p className="muted" style={{ fontSize: "0.8rem" }}>
-                    Amounts come from decrypting the indexed ciphertext. A pasted receipt is only a cross-check.
-                  </p>
-                </div>
-
-                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => setReceiptInput(JSON.stringify(SAMPLE_AUDIT_RECEIPT, null, 2))}
-                    title="Load a verified sample audit receipt from Devnet"
-                  >
-                    ⚡ Load Demo Audit Receipt
-                  </button>
-                  {recentPayrollRuns.length > 0 && (
-                    <button
-                      className="btn btn-outline-emerald btn-sm"
-                      onClick={() => setReceiptInput(JSON.stringify(recentPayrollRuns[0], null, 2))}
-                    >
-                      📄 Paste Latest Run Receipt
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem", flexWrap: "wrap" }}>
-                <button
-                  className={`btn btn-sm ${verifyMode === "paystub" ? "btn-primary" : "btn-secondary"}`}
-                  onClick={() => setVerifyMode("paystub")}
-                  type="button"
-                >
-                  Single-recipient paystub
-                </button>
-                <button
-                  className={`btn btn-sm ${verifyMode === "employer" ? "btn-primary" : "btn-secondary"}`}
-                  onClick={() => setVerifyMode("employer")}
-                  type="button"
-                >
-                  Employer / CPA batch audit
-                </button>
-              </div>
-              <p className="muted" style={{ fontSize: "0.78rem", marginBottom: "0.75rem" }}>
-                {verifyMode === "paystub"
-                  ? "Paystub mode calls decryptUtxo on the recipient viewing key. That call opens this note. The same 32-byte ViewingKey also opens every other note encrypted to this wallet."
-                  : "Batch audit derives transactionViewingKey(firstNullifier) and calls decryptSlotEphemeral on every slot. That opens sender change and every recipient."}
-              </p>
-              {verifyMode === "paystub" && (
-                <div style={{ background: "rgba(245, 158, 11, 0.12)", border: "1px solid rgba(245, 158, 11, 0.45)", padding: "0.75rem 1rem", borderRadius: "0.5rem", color: "#FCD34D", fontSize: "0.8rem", marginBottom: "0.75rem" }}>
-                  Your 32-byte ViewingKey opens ALL incoming notes to your wallet—only use it in your own browser; never paste it on a third party's device.
-                </div>
-              )}
-              {verifyMode === "employer" && (
-                <label style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start", fontSize: "0.78rem", marginBottom: "0.75rem" }}>
-                  <input
-                    type="checkbox"
-                    checked={employerWarned}
-                    onChange={(event) => setEmployerWarned(event.target.checked)}
-                  />
-                  <span>
-                    I understand this transaction viewing key reveals change and every recipient in the batch. It is not a single-contractor paystub.
-                  </span>
-                </label>
-              )}
-              <label style={{ display: "flex", gap: "0.5rem", alignItems: "center", fontSize: "0.78rem", marginBottom: "0.5rem" }}>
-                <input
-                  type="checkbox"
-                  checked={useConnectedKey}
-                  onChange={(event) => setUseConnectedKey(event.target.checked)}
-                />
-                Use the connected wallet. The viewing key is not written to Local Storage.
-              </label>
-              {!useConnectedKey && (
-                <textarea
-                  className="csv-textarea"
-                  placeholder="32-byte viewing key, hex or base58. Not the 64-byte ed25519 derivation signature."
-                  value={viewingKeyInput}
-                  onChange={(event) => setViewingKeyInput(event.target.value)}
-                  autoComplete="off"
-                  spellCheck={false}
-                  style={{ height: "4.5rem", marginBottom: "0.75rem" }}
-                />
-              )}
-              <textarea
-                className="csv-textarea"
-                placeholder="Paste a transaction signature, or a Ciphra receipt JSON. Receipt amounts are checked against the decrypted notes."
-                value={receiptInput}
-                onChange={(e) => setReceiptInput(e.target.value)}
-                style={{ height: "8.5rem", marginBottom: "1rem" }}
-              />
-
-              <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.5rem", flexWrap: "wrap" }}>
-                <button
-                  className="btn btn-primary"
-                  disabled={verifying || !receiptInput.trim() || (!useConnectedKey && !viewingKeyInput.trim())}
-                  onClick={handleVerifyReceipt}
-                >
-                  {verifying ? "Decrypting indexed notes…" : "Decrypt and verify on-chain"}
-                </button>
-                {verifyMode === "employer" && (
-                  <button
-                    className="btn btn-secondary"
-                    type="button"
-                    disabled={!employerWarned || !receiptInput.trim()}
-                    onClick={handleExportTransactionViewingKey}
-                  >
-                    {copiedText === "tx-viewing-key" ? "Copied transaction viewing key" : "Export batch transaction viewing key"}
-                  </button>
-                )}
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => {
-                    setReceiptInput("");
-                    setVerificationResult(null);
-                    setVerificationError("");
-                  }}
-                >
-                  Clear
-                </button>
-              </div>
-
-              {verificationError && (
-                <div style={{ background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.3)", padding: "0.75rem 1rem", borderRadius: "0.5rem", color: "#FCA5A5", fontSize: "0.85rem", marginBottom: "1.5rem" }}>
-                  Verification Failed: {verificationError}
-                </div>
-              )}
-
-              {/* Holographic Verified Certificate Card */}
-              {verificationResult && (
-                <div className="holographic-cert">
-                  <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem", padding: "0.25rem 0.65rem", borderRadius: "9999px", background: verificationResult.integrity === "TAMPERED" ? "rgba(239, 68, 68, 0.15)" : "rgba(16, 185, 129, 0.15)", border: `1px solid ${verificationResult.integrity === "TAMPERED" ? "rgba(239, 68, 68, 0.4)" : "rgba(16, 185, 129, 0.4)"}`, color: verificationResult.integrity === "TAMPERED" ? "#FCA5A5" : "#34D399", fontSize: "0.75rem", fontWeight: 700, marginBottom: "0.75rem", flexWrap: "wrap" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "0.35rem" }}>
-                      <span>🛡️</span>
-                      <span>{verificationResult.integrity === "TAMPERED" ? "TAMPERED — RECEIPT ≠ DECRYPTED NOTES" : "DECRYPTED FROM THE INDEXED TRANSACTION"}</span>
-                    </div>
-                    {verificationResult.payerSignatureVerified && (
-                      <span style={{ paddingLeft: "0.5rem", borderLeft: "1px solid rgba(16, 185, 129, 0.4)", color: "#10B981" }}>
-                        ✓ Ed25519 Payer Authenticated
-                      </span>
-                    )}
-                  </div>
-
-                  <h3 style={{ fontSize: "1.35rem", fontWeight: 800, marginBottom: "0.25rem" }}>
-                    Ciphra Zero-Knowledge Audit Certificate
-                  </h3>
-                  <p className="muted" style={{ fontSize: "0.825rem", marginBottom: "1.5rem" }}>
-                    Verified On-Chain Execution & Tamper-Evident Receipt Binding. Transaction confirmed against Solana Privacy Rings & Helius Devnet RPC.
-                  </p>
-
-                  <div className="cert-meta-grid">
-                    <div className="cert-meta-item">
-                      <span className="cert-meta-label">On-Chain Tx Signature</span>
-                      <a
-                        href={`https://solscan.io/tx/${verificationResult.txSignature}?cluster=devnet`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="mono"
-                        style={{ color: "var(--cyan-primary)", fontSize: "0.85rem", textDecoration: "none" }}
-                      >
-                        {verificationResult.txSignature.slice(0, 16)}…{verificationResult.txSignature.slice(-8)} ↗
-                      </a>
-                    </div>
-
-                    <div className="cert-meta-item">
-                      <span className="cert-meta-label">Landed Block Slot</span>
-                      <span className="cert-meta-val">#{verificationResult.slot}</span>
-                    </div>
-
-                    <div className="cert-meta-item">
-                      <span className="cert-meta-label">Disbursed Currency / Asset</span>
-                      <span className="cert-meta-val" style={{ color: verificationResult.asset === "USDC" ? "#60A5FA" : "#34D399", fontWeight: 700 }}>
-                        {verificationResult.asset || "SOL"} ({verificationResult.decimals ?? (verificationResult.asset === "USDC" ? 6 : 9)} decimals)
-                      </span>
-                    </div>
-
-                    <div className="cert-meta-item">
-                      <span className="cert-meta-label">Total Verified Disbursement</span>
-                      <span className="cert-meta-val" style={{ color: verificationResult.asset === "USDC" ? "#60A5FA" : "#34D399", fontWeight: 700 }}>
-                        {formatSol(verificationResult.totalDisclosed ?? verificationResult.totalDisclosedSol)} {verificationResult.asset || "SOL"}
-                      </span>
-                    </div>
-
-                    <div className="cert-meta-item">
-                      <span className="cert-meta-label">Privacy Ring Program</span>
-                      <span className="cert-meta-val" style={{ fontSize: "0.8rem" }}>
-                        {verificationResult.ringProgramId}
-                      </span>
-                    </div>
-
-                    <div className="cert-meta-item">
-                      <span className="cert-meta-label">Attesting Payer Wallet</span>
-                      <span className="cert-meta-val mono" style={{ fontSize: "0.85rem" }}>
-                        {verificationResult.payerPubkey
-                          ? `${verificationResult.payerPubkey.slice(0, 6)}…${verificationResult.payerPubkey.slice(-6)}`
-                          : "—"}
-                      </span>
-                    </div>
-
-                    <div className="cert-meta-item">
-                      <span className="cert-meta-label">Protocol Fee (0.25%)</span>
-                      <span className="cert-meta-val" style={{ fontSize: "0.85rem" }}>
-                        {verificationResult.protocolFee
-                          ? `${formatSol(verificationResult.protocolFee.amount ?? verificationResult.protocolFee.amountSol ?? 0)} ${verificationResult.asset || "SOL"}`
-                          : "—"}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Integrity Verification Checks */}
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0.5rem", marginTop: "1rem", padding: "0.75rem", background: "rgba(255, 255, 255, 0.02)", borderRadius: "0.5rem", border: "1px solid var(--border-card)" }}>
-                    <div style={{ fontSize: "0.775rem" }}>
-                      <span style={{ color: "var(--text-secondary)" }}>On-Chain Tx Success: </span>
-                      <span style={{ color: verificationResult.txSuccessConfirmed ? "#34D399" : "#F87171", fontWeight: 600 }}>
-                        {verificationResult.txSuccessConfirmed ? "✓ meta.err === null" : "✕ Failed"}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: "0.775rem" }}>
-                      <span style={{ color: "var(--text-secondary)" }}>Slot Match: </span>
-                      <span style={{ color: verificationResult.onChainSlotMatch ? "#34D399" : "#FBBF24", fontWeight: 600 }}>
-                        {verificationResult.onChainSlotMatch ? "✓ Confirmed" : "⚠ Mismatch"}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: "0.775rem" }}>
-                      <span style={{ color: "var(--text-secondary)" }}>Privacy Rings Program: </span>
-                      <span style={{ color: verificationResult.programInvocationConfirmed ? "#34D399" : "#FBBF24", fontWeight: 600 }}>
-                        {verificationResult.programInvocationConfirmed ? "✓ ring1GaLC…XANW" : "— Not verified"}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: "0.775rem" }}>
-                      <span style={{ color: "var(--text-secondary)" }}>SHA-256 Commitment: </span>
-                      <span style={{ color: verificationResult.commitmentVerified === true ? "#34D399" : verificationResult.commitmentVerified === false ? "#F87171" : "var(--text-muted)", fontWeight: 600 }}>
-                        {verificationResult.commitmentVerified === true
-                          ? "✓ Tamper-evident digest matches"
-                          : verificationResult.commitmentVerified === false
-                          ? "✕ Digest mismatch — tampered"
-                          : "— No hash in receipt"}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: "0.775rem" }}>
-                      <span style={{ color: "var(--text-secondary)" }}>Ed25519 Payer Signature: </span>
-                      <span style={{ color: verificationResult.payerSignatureVerified ? "#34D399" : "#F87171", fontWeight: 600 }}>
-                        {verificationResult.payerSignatureVerified
-                          ? `✓ Authenticated (${verificationResult.payerPubkey?.slice(0, 4)}…${verificationResult.payerPubkey?.slice(-4)})`
-                          : "✕ Unverified Signature"}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Institutional Attestation Clarification */}
-                  <div style={{ marginTop: "0.75rem", padding: "0.6rem 0.85rem", background: "rgba(16, 185, 129, 0.05)", border: "1px solid rgba(16, 185, 129, 0.2)", borderRadius: "0.375rem" }}>
-                    <p style={{ fontSize: "0.775rem", margin: 0, color: "var(--text-secondary)", lineHeight: 1.45 }}>
-                      <strong style={{ color: "#34D399" }}>Institutional Attestation Notice:</strong> Disclosed payout amounts, recipient addresses, and block slots are cryptographically bound and attested by the payer's Ed25519 digital signature, while shielded company treasury balances remain zero-knowledge encrypted on Solana Privacy Rings.
-                    </p>
-                  </div>
-
-                  {verificationResult.receiptCommitmentHash && (
-                    <div style={{ marginTop: "0.5rem", padding: "0.5rem 0.75rem", background: "rgba(255, 255, 255, 0.02)", borderRadius: "0.375rem", border: "1px solid var(--border-card)" }}>
-                      <span style={{ fontSize: "0.7rem", color: "var(--text-secondary)" }}>Receipt Commitment Hash (SHA-256): </span>
-                      <code className="mono" style={{ fontSize: "0.7rem", color: "var(--cyan-primary)", wordBreak: "break-all" }}>
-                        {verificationResult.receiptCommitmentHash}
-                      </code>
-                    </div>
-                  )}
-
-                  {/* Disclosed Payouts Table */}
-                  <div style={{ marginTop: "1.25rem" }}>
-                    <h4 style={{ fontSize: "0.9rem", fontWeight: 600, marginBottom: "0.5rem" }}>
-                    On-chain decrypted outputs ({verificationResult.integrity})
-                  </h4>
-                  {verificationResult.integrity === "TAMPERED" && (
-                    <p style={{ color: "#FCA5A5", fontSize: "0.8rem" }}>{verificationResult.tamperReason}</p>
-                  )}
-                    <div className="payroll-table-wrap">
-                      <table className="payroll-table">
-                        <thead>
-                          <tr>
-                            <th>Slot</th>
-                            <th>Role</th>
-                            <th>Mint</th>
-                            <th>Amount</th>
-                            <th>Viewing key</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {verificationResult.decryptedOutputs.map((note) => (
-                            <tr key={`${note.signature}-${note.slotIndex}`}>
-                              <td className="mono">{note.slotIndex}</td>
-                              <td>{note.role}</td>
-                              <td className="mono" style={{ fontSize: "0.75rem" }}>{note.mint}</td>
-                              <td className="mono" style={{ fontWeight: 600 }}>{note.amountDisplay}</td>
-                              <td className="mono" style={{ fontSize: "0.75rem" }}>{note.recipientViewingKey.slice(0, 12)}…</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-
-                  <div style={{ display: "flex", gap: "0.5rem", marginTop: "1.5rem" }}>
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => copyToClipboard(verificationResult.txSignature, "hash")}
-                    >
-                      {copiedText === "hash" ? "Copied Hash!" : "📋 Copy Verification Hash"}
-                    </button>
-                    <button
-                      className="btn btn-outline-emerald btn-sm"
-                      onClick={() => downloadJson(`ciphra-certificate-${verificationResult.txSignature.slice(0, 8)}.json`, verificationResult)}
-                    >
-                      ⬇️ Download Certificate JSON
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
+          {activeTab === "verify" && verifyView}
         </>
       )}
 

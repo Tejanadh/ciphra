@@ -34,7 +34,7 @@ import {
   type IndexedShieldedTransaction,
 } from "@heliuslabs/spr/transaction";
 import { getAssociatedTokenAddress } from "@heliuslabs/spr/addresses";
-import { backfillAssetRegistry, fetchUserRecord } from "@heliuslabs/spr/wallet";
+import { backfillAssetRegistry, fetchUserRecord, resolveRegisteredAddress } from "@heliuslabs/spr/wallet";
 import { ed25519DerivationMessage } from "@heliuslabs/spr/keypair";
 import {
   getCreateAssociatedTokenIdempotentInstruction,
@@ -68,7 +68,10 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import { SprWebProver, type Measurement } from "@heliuslabs/spr-web-prover";
 import { signConnectedWalletMessage, type WalletSessionUnlock } from "./burner.js";
 import { deployments, remoteProverConfig, sprEndpoints } from "./deployments";
+import { compareDecryptedAmounts, type AuditIntegrity } from "./compare-decrypted-amounts.js";
 import { MAX_LOCAL_INPUTS, limitLocalProofs, localSpendLimit, MERGE_FIRST } from "./local-proving.js";
+export { compareDecryptedAmounts };
+export type { AuditIntegrity };
 export type { Payment };
 
 const selectedNetwork: string = import.meta.env.VITE_ZOLANA_NETWORK ?? "devnet";
@@ -459,6 +462,8 @@ export type PayrollChunkStatus = "pending" | "submitted" | "confirmed" | "failed
 
 interface JournalRecipient {
   readonly recipient: string;
+  /** Hex of `ShieldedAddress.toBytes()`. Absent on receipts written before this field. */
+  readonly shieldedAddress?: string;
   readonly amountBaseUnits: string;
   readonly memo: string;
 }
@@ -467,6 +472,8 @@ interface JournalChunk {
   readonly index: number;
   readonly recipients: readonly JournalRecipient[];
   readonly feeCollector: string;
+  /** Hex shielded address of the fee collector, when the registry had one. */
+  readonly feeCollectorShieldedAddress?: string;
   readonly feeBaseUnits: string;
   readonly feeBps: number;
   status: PayrollChunkStatus;
@@ -701,6 +708,8 @@ export interface PayrollRecipientInput {
 
 export interface PayrollPayoutRecord {
   readonly recipient: string;
+  /** Hex of the recipient `ShieldedAddress`. Paystub verification refuses lines that omit it. */
+  readonly shieldedAddress?: string;
   readonly amount?: number;
   readonly amountSol?: number;
   readonly amountBaseUnits: string;
@@ -716,6 +725,7 @@ export interface PayrollChunkExecution {
   readonly payouts: readonly PayrollPayoutRecord[];
   readonly protocolFee: {
     readonly collector: string;
+    readonly shieldedAddress?: string;
     readonly amount: number;
     readonly amountSol?: number;
     readonly amountBaseUnits: string;
@@ -771,6 +781,7 @@ function chunkExecution(assetSymbol: AssetSymbol, decimals: number, chunk: Journ
       const amount = Number(units) / 10 ** decimals;
       return {
         recipient: recipient.recipient,
+        ...(recipient.shieldedAddress === undefined ? {} : { shieldedAddress: recipient.shieldedAddress }),
         amount,
         amountSol: amount,
         amountBaseUnits: recipient.amountBaseUnits,
@@ -780,6 +791,7 @@ function chunkExecution(assetSymbol: AssetSymbol, decimals: number, chunk: Journ
     }),
     protocolFee: {
       collector: chunk.feeCollector,
+      ...(chunk.feeCollectorShieldedAddress === undefined ? {} : { shieldedAddress: chunk.feeCollectorShieldedAddress }),
       amount: Number(BigInt(chunk.feeBaseUnits)) / 10 ** decimals,
       amountSol: Number(BigInt(chunk.feeBaseUnits)) / 10 ** decimals,
       amountBaseUnits: chunk.feeBaseUnits,
@@ -944,22 +956,36 @@ export async function runBatchPayroll(
     chunked.push(recipients.slice(index, index + MAX_RECIPIENTS_PER_CHUNK));
   }
 
+  const shieldedByOwner = new Map<string, string>();
+  const owners = new Set<string>([feeCollector.trim(), ...recipients.map((recipient) => recipient.recipient.trim())]);
+  for (const owner of owners) {
+    const resolved = await resolveRegisteredAddress({ rpc: session.client, owner: address(owner) }).catch(() => undefined);
+    if (resolved !== undefined) shieldedByOwner.set(owner, hexBytes(resolved.address.toBytes()));
+  }
   const planned: JournalChunk[] = chunked.map((chunk, index) => {
     const chunkBaseUnits = parseAmount(
       chunk.reduce((sum, recipient) => sum + getAmountNum(recipient), 0).toFixed(decimals),
       decimals,
     );
+    const collector = feeCollector.trim();
+    const collectorShielded = shieldedByOwner.get(collector);
     return {
       index,
-      recipients: chunk.map((recipient) => ({
-        recipient: recipient.recipient.trim(),
-        amountBaseUnits: parseAmount(getAmountNum(recipient).toFixed(decimals), decimals).toString(),
-        memo: recipient.memo || `Ciphra ${assetSymbol} Payroll`,
-      })),
-      feeCollector: feeCollector.trim(),
+      recipients: chunk.map((recipient) => {
+        const solanaAddress = recipient.recipient.trim();
+        const shieldedAddress = shieldedByOwner.get(solanaAddress);
+        return {
+          recipient: solanaAddress,
+          ...(shieldedAddress === undefined ? {} : { shieldedAddress }),
+          amountBaseUnits: parseAmount(getAmountNum(recipient).toFixed(decimals), decimals).toString(),
+          memo: recipient.memo || `Ciphra ${assetSymbol} Payroll`,
+        };
+      }),
+      feeCollector: collector,
+      ...(collectorShielded === undefined ? {} : { feeCollectorShieldedAddress: collectorShielded }),
       feeBaseUnits: ((chunkBaseUnits * BigInt(protocolFeeBps)) / 10000n).toString(),
       feeBps: protocolFeeBps,
-      status: "pending",
+      status: "pending" as const,
     };
   });
   const planKey = payrollPlanKey(mint.toString(), feeCollector.trim(), protocolFeeBps, planned);
@@ -1136,12 +1162,17 @@ export interface DecryptedNote {
   readonly amountDisplay: string;
   readonly role: "recipient" | "sender-change" | "opened-note";
   readonly recipientViewingKey: string;
+  /**
+   * Set only when this zero-amount output was proven to be shape padding.
+   * A zero note without this flag is a real output and stays in the comparison.
+   */
+  readonly paddingProven?: boolean;
 }
 
 export interface VerificationResult {
   readonly valid: boolean;
   readonly mode: VerifyAuditMode;
-  readonly integrity: "VERIFIED" | "TAMPERED";
+  readonly integrity: AuditIntegrity;
   readonly tamperReason?: string;
   readonly decryptedOutputs: readonly DecryptedNote[];
   readonly txSignature: string;
@@ -1644,80 +1675,6 @@ async function decryptIndexedTransaction(
   }
 }
 
-function claimedUnits(value: { amountBaseUnits?: unknown; amount?: unknown; amountSol?: unknown }, decimals: number): bigint | undefined {
-  if (typeof value.amountBaseUnits === "string" && /^\d+$/.test(value.amountBaseUnits)) {
-    return BigInt(value.amountBaseUnits);
-  }
-  const amount = Number(value.amount ?? value.amountSol);
-  if (!Number.isFinite(amount) || amount < 0) return undefined;
-  return parseAmount(amount.toFixed(decimals), decimals);
-}
-
-function subtractAmounts(haystack: readonly bigint[], needles: readonly bigint[]): { missing: bigint[]; leftover: bigint[] } {
-  const left = [...haystack];
-  const missing: bigint[] = [];
-  for (const needle of needles) {
-    const index = left.findIndex((value) => value === needle);
-    if (index < 0) missing.push(needle);
-    else left.splice(index, 1);
-  }
-  return { missing, leftover: left };
-}
-
-function compareDecryptedAmounts(
-  mode: VerifyAuditMode,
-  notes: readonly DecryptedNote[],
-  chunks: readonly any[],
-  decimals: number,
-): { integrity: "VERIFIED" | "TAMPERED"; reason: string } {
-  const payouts: bigint[] = [];
-  const fees: bigint[] = [];
-  for (const chunk of chunks) {
-    const rows = Array.isArray(chunk?.payouts) ? chunk.payouts : [];
-    for (const payout of rows) {
-      const units = claimedUnits(payout, decimals);
-      if (units !== undefined) payouts.push(units);
-    }
-    if (chunk?.protocolFee) {
-      const units = claimedUnits(chunk.protocolFee, decimals);
-      if (units !== undefined && units > 0n) fees.push(units);
-    }
-  }
-  if (payouts.length === 0 && fees.length === 0) return { integrity: "VERIFIED", reason: "" };
-  if (mode === "paystub") {
-    const opened = notes.map((note) => BigInt(note.amountBaseUnits));
-    const check = subtractAmounts(payouts, opened);
-    if (check.missing.length > 0) {
-      return {
-        integrity: "TAMPERED",
-        reason: "An amount opened by this recipient viewing key is not in the pasted receipt.",
-      };
-    }
-    return { integrity: "VERIFIED", reason: "" };
-  }
-  const recipientAmounts = notes
-    .filter((note) => note.role === "recipient" || note.role === "opened-note")
-    .map((note) => BigInt(note.amountBaseUnits));
-  const senderAmounts = notes
-    .filter((note) => note.role === "sender-change")
-    .map((note) => BigInt(note.amountBaseUnits));
-  const payoutsOnly = subtractAmounts(recipientAmounts, payouts);
-  const payoutsPlusFees = subtractAmounts(recipientAmounts, [...payouts, ...fees]);
-  const senderHoldsFees = subtractAmounts(senderAmounts, fees).missing.length === 0;
-  const recipientExact = payoutsOnly.missing.length === 0 && payoutsOnly.leftover.length === 0 && senderHoldsFees;
-  const feeIsRecipient = payoutsPlusFees.missing.length === 0 && payoutsPlusFees.leftover.length === 0;
-  if (recipientExact || feeIsRecipient) return { integrity: "VERIFIED", reason: "" };
-  const allAmounts = notes.map((note) => BigInt(note.amountBaseUnits));
-  const claimed = subtractAmounts(allAmounts, [...payouts, ...fees]);
-  if (claimed.missing.length > 0) {
-    return {
-      integrity: "TAMPERED",
-      reason: "The receipt lists an amount that is not in the on-chain decrypted outputs.",
-    };
-  }
-  return { integrity: "VERIFIED", reason: "" };
-}
-
 /** 32-byte viewing-key secret. Rejects a 64-byte ed25519 derivation signature. */
 export function parseViewingKeyBytes(text: string): Uint8Array {
   const trimmed = text.trim();
@@ -1999,15 +1956,15 @@ export async function verifyAuditReceipt(
       decryptedOutputs.push(...await decryptIndexedTransaction(session, event.transaction, options));
     }
   }
-  if (decryptedOutputs.length === 0) {
-    throw new Error(
-      options.mode === "paystub"
-        ? "This viewing key opened no output. decryptUtxo only opens a note encrypted to that key."
-        : "The transaction viewing key opened no confidential output.",
-    );
-  }
 
-  const audit = compareDecryptedAmounts(options.mode, decryptedOutputs, rawChunks, decimals);
+  const senderShieldedAddress = hexBytes(session.shieldedAddress.toBytes());
+  const audit = compareDecryptedAmounts(options.mode, decryptedOutputs, rawChunks, decimals, {
+    ...(options.mode === "paystub" && options.useSessionKey === true
+      ? { paystubShieldedAddress: senderShieldedAddress }
+      : {}),
+    senderAddress: detectedOnChainSigner || session.signer.address,
+    senderShieldedAddress,
+  });
   const chainPayouts: PayrollPayoutRecord[] = decryptedOutputs.map((note) => ({
     recipient: note.role === "sender-change"
       ? `sender change ${note.recipientViewingKey}`
