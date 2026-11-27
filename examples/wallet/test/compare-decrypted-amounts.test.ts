@@ -129,6 +129,17 @@ test("3. employer mode matches payouts exactly and refuses hidden outputs, count
   assert.equal(missingCount.integrity, "TAMPERED");
   assert.equal(missingCount.reason, "The receipt lists an amount that is not in the on-chain decrypted outputs.");
 
+  // Two identical payments to one recipient are two pairs. Both sides listing both is VERIFIED.
+  const doublePayment = compareDecryptedAmounts(
+    "employer",
+    [paid(100n, alice), paid(100n, alice)],
+    [{ payouts: [line(100n, alice.shielded), line(100n, alice.shielded)] }],
+    DECIMALS,
+    employer,
+  );
+  assert.equal(doublePayment.integrity, "VERIFIED");
+  assert.equal(doublePayment.reason, "");
+
   const provenPadding = compareDecryptedAmounts(
     "employer",
     [note(0n, "recipient", true), paid(100n, alice)],
