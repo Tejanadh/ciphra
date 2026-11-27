@@ -1,28 +1,29 @@
 :root {
-  --bg-canvas: #050507;
-  --bg-card: #0B0D12;
-  --bg-card-hover: #10131B;
-  --bg-card-elevated: #131722;
-  --bg-input: #080A0E;
-  
-  --border-card: rgba(255, 255, 255, 0.07);
-  --border-specular: rgba(255, 255, 255, 0.16);
-  --border-focus: #10B981;
+  --bg-canvas: #070708;
+  --bg-card: #0c0c0d;
+  --bg-card-hover: #121214;
+  --bg-card-elevated: #141416;
+  --bg-input: #0c0c0d;
 
-  --text-primary: #F4F4F5;
-  --text-secondary: #A1A1AA;
-  --text-muted: #52525B;
+  --border-card: rgba(255, 255, 255, 0.1);
+  --border-specular: rgba(255, 255, 255, 0.14);
+  --border-focus: #f4f4f1;
 
-  --emerald-primary: #10B981;
-  --emerald-glow: rgba(16, 185, 129, 0.22);
-  --emerald-subtle: rgba(16, 185, 129, 0.12);
-  --cyan-primary: #06B6D4;
-  --indigo-primary: #6366F1;
-  --amber-primary: #F59E0B;
-  --danger-primary: #EF4444;
+  --text-primary: #f4f4f1;
+  --text-secondary: #a3a39c;
+  --text-muted: #6f6f68;
 
-  --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --emerald-primary: #d7d7d1;
+  --emerald-glow: transparent;
+  --emerald-subtle: rgba(255, 255, 255, 0.06);
+  --cyan-primary: #f4f4f1;
+  --indigo-primary: #f4f4f1;
+  --amber-primary: #e7c27a;
+  --danger-primary: #f0a3a3;
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   color-scheme: dark;
 }
@@ -35,9 +36,6 @@
 
 body {
   background-color: var(--bg-canvas);
-  background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(16, 185, 129, 0.14), transparent 70%);
-  background-repeat: no-repeat;
-  background-attachment: fixed;
   color: var(--text-primary);
   font-family: var(--font-sans);
   min-height: 100vh;
@@ -48,24 +46,21 @@ body {
 
 /* Base Container */
 .app-container {
-  max-width: 76rem;
+  max-width: 72rem;
   margin: 0 auto;
-  padding: 1.25rem 1.25rem 4rem;
+  padding: 0 1.5rem 6rem;
 }
 
-/* Specular Card Component */
+/* Hairline panel. The app still uses this class for desks and modals. */
 .card-specular {
-  background: var(--bg-card);
-  border-top: 1px solid var(--border-specular);
-  border-left: 1px solid var(--border-card);
-  border-right: 1px solid var(--border-card);
-  border-bottom: 1px solid var(--border-card);
-  border-radius: 1rem;
-  box-shadow: 0 4px 24px -2px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  background: transparent;
+  border: 1px solid var(--border-card);
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .card-specular:hover {
-  border-top-color: rgba(255, 255, 255, 0.22);
+  border-color: rgba(255, 255, 255, 0.18);
 }
 
 /* Top Navbar */
@@ -73,15 +68,16 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.875rem 1.25rem;
-  margin-bottom: 1.75rem;
-  border-radius: 1rem;
-  background: rgba(11, 13, 18, 0.85);
-  backdrop-filter: blur(12px);
-  border-top: 1px solid var(--border-specular);
-  border-left: 1px solid var(--border-card);
-  border-right: 1px solid var(--border-card);
-  border-bottom: 1px solid var(--border-card);
+  gap: 1rem;
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  padding: 1rem 0;
+  margin: 0 0 0;
+  border-radius: 0;
+  background: #070708;
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .brand-wrap {
@@ -93,36 +89,27 @@ body {
 }
 
 .brand-logo {
-  width: 2.25rem;
-  height: 2.25rem;
-  background: linear-gradient(135deg, #10B981, #06B6D4);
-  border-radius: 0.625rem;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1.15rem;
-  box-shadow: 0 0 16px var(--emerald-glow);
+  display: none;
 }
 
 .brand-text {
-  font-size: 1.35rem;
-  font-weight: 800;
+  font-family: var(--font-serif);
+  font-size: 1.7rem;
+  font-weight: 400;
   letter-spacing: -0.03em;
-  background: linear-gradient(180deg, #FFFFFF 0%, #D4D4D8 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: var(--text-primary);
 }
 
 .brand-pill {
-  font-size: 0.65rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 0.15rem 0.5rem;
-  border-radius: 9999px;
-  background: var(--emerald-subtle);
-  color: #34D399;
-  border: 1px solid rgba(16, 185, 129, 0.3);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  text-transform: none;
 }
 
 .network-pill {
@@ -157,10 +144,10 @@ body {
    LANDING HERO VIEW
    ======================================================== */
 .hero-section {
-  text-align: center;
-  padding: 3rem 1rem 4rem;
+  text-align: left;
+  padding: 6.5rem 0 3.5rem;
   max-width: 58rem;
-  margin: 0 auto;
+  margin: 0;
 }
 
 .hero-eyebrow {
@@ -179,31 +166,117 @@ body {
 }
 
 .hero-headline {
-  font-size: 3.25rem;
-  font-weight: 800;
-  line-height: 1.12;
-  letter-spacing: -0.04em;
-  background: linear-gradient(180deg, #FFFFFF 20%, #A1A1AA 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  margin-bottom: 1.25rem;
+  font-family: var(--font-serif);
+  font-size: clamp(3.6rem, 8.4vw, 7.4rem);
+  font-weight: 400;
+  line-height: 0.9;
+  letter-spacing: -0.035em;
+  color: var(--text-primary);
+  margin-bottom: 1.5rem;
+}
+
+.hero-headline em {
+  font-style: italic;
+  font-weight: 400;
 }
 
 .hero-subheadline {
   font-size: 1.15rem;
   color: var(--text-secondary);
-  line-height: 1.6;
-  max-width: 44rem;
-  margin: 0 auto 2.25rem;
+  line-height: 1.55;
+  max-width: 36rem;
+  margin: 0 0 2rem;
 }
 
 .hero-actions {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 1rem;
-  margin-bottom: 1.5rem;
+  justify-content: flex-start;
+  gap: 0.75rem;
+  margin-bottom: 0;
   flex-wrap: wrap;
+}
+
+.rail {
+  overflow: hidden;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin: 3.5rem 0 4.5rem;
+  padding: 0.9rem 0;
+}
+
+.rail-track {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.5rem;
+  font-size: 0.78rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.section-kicker {
+  font-size: 0.75rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.8rem;
+}
+
+.section-title {
+  font-family: var(--font-serif);
+  font-size: clamp(2.2rem, 4vw, 3.4rem);
+  font-weight: 400;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  margin-bottom: 2rem;
+  max-width: 16ch;
+}
+
+.product-list {
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  margin-bottom: 5rem;
+}
+
+.product-row {
+  display: grid;
+  grid-template-columns: 4.5rem 1fr auto;
+  gap: 1.5rem;
+  align-items: center;
+  padding: 1.75rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  text-align: left;
+}
+
+.product-index {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.product-row h3 {
+  font-family: var(--font-serif);
+  font-size: 2rem;
+  font-weight: 400;
+  letter-spacing: -0.03em;
+  margin-bottom: 0.35rem;
+}
+
+.product-row p {
+  color: var(--text-secondary);
+  max-width: 38rem;
+  font-size: 0.98rem;
+}
+
+.site-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-top: 2rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+  font-size: 0.8rem;
 }
 
 .hero-trust-badge {
@@ -451,8 +524,8 @@ body {
 }
 
 .telemetry-val.emerald {
-  color: #34D399;
-  text-shadow: 0 0 12px var(--emerald-glow);
+  color: var(--text-primary);
+  text-shadow: none;
 }
 
 .telemetry-sub {
@@ -600,32 +673,32 @@ body {
   align-items: center;
   justify-content: center;
   gap: 0.45rem;
-  font-weight: 600;
-  font-size: 0.875rem;
-  padding: 0.6rem 1.15rem;
-  border-radius: 0.625rem;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 0.9rem;
+  padding: 0.72rem 1.15rem;
+  border-radius: 999px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
   user-select: none;
 }
 
 .btn-primary {
-  background: linear-gradient(180deg, #10B981 0%, #059669 100%);
-  color: #FFFFFF;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  box-shadow: 0 4px 14px var(--emerald-glow), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  background: #f4f4f1;
+  color: #111111;
+  border: 1px solid #f4f4f1;
+  box-shadow: none;
 }
 
 .btn-primary:hover:not(:disabled) {
-  filter: brightness(1.1);
-  transform: translateY(-1px);
+  background: #ffffff;
 }
 
 .btn-secondary {
-  background: rgba(255, 255, 255, 0.04);
+  background: transparent;
   color: var(--text-primary);
-  border: 1px solid var(--border-card);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow: none;
 }
 
 .btn-secondary:hover:not(:disabled) {
@@ -645,9 +718,9 @@ body {
 }
 
 .btn-sm {
-  font-size: 0.775rem;
-  padding: 0.35rem 0.7rem;
-  border-radius: 0.5rem;
+  font-size: 0.78rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
 }
 
 .btn:disabled {
@@ -865,23 +938,26 @@ body {
 .text-center { text-align: center; }
 
 @media (max-width: 840px) {
-  .hero-headline { font-size: 2.25rem; }
+  .hero-headline { font-size: 3.2rem; }
   .bento-grid { grid-template-columns: 1fr; }
+  .product-row { grid-template-columns: 1fr; gap: 0.6rem; }
   .telemetry-strip { flex-direction: column; align-items: flex-start; }
   .cert-meta-grid { grid-template-columns: 1fr; }
+  .site-footer { flex-direction: column; }
 }
 
 /* ============================================================================
    ON-CHAIN TREASURY LEAK SCANNER
    ============================================================================ */
 .scanner-container {
-  margin: 2.5rem 0 2rem;
-  padding: 1.75rem;
-  background: linear-gradient(180deg, rgba(20, 16, 28, 0.75) 0%, rgba(11, 13, 18, 0.95) 100%);
-  border: 1px solid rgba(239, 68, 68, 0.25);
-  border-top: 1px solid rgba(239, 68, 68, 0.45);
-  border-radius: 0.875rem;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  margin: 0 0 4rem;
+  padding: 0 0 2rem;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 0;
+  box-shadow: none;
+  text-align: left;
 }
 
 .scanner-header {

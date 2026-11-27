@@ -7,7 +7,9 @@ export function remoteProverConfig(proverUrl: string, policyFile: unknown) {
 
 // The Helius gateway serves the indexer and the attested prover on one keyed URL.
 export function sprEndpoints(sprUrl: string, apiKey: string) {
-  const url = `${sprUrl}?api-key=${encodeURIComponent(apiKey)}`;
+  const key = apiKey.trim();
+  if (key.length === 0) return { indexerUrl: sprUrl, proverUrl: sprUrl };
+  const url = `${sprUrl}?api-key=${encodeURIComponent(key)}`;
   return { indexerUrl: url, proverUrl: url };
 }
 

@@ -359,11 +359,6 @@ export function App(): React.ReactElement {
   };
 
   useEffect(() => {
-    // Initial scan of sample treasury for instant interactive visual
-    void handleScanExposure(SAMPLE_DAO_TREASURY);
-  }, []);
-
-  useEffect(() => {
     if (persistPayrollHistory) return;
     try {
       localStorage.removeItem(RECENT_PAYROLL_RUNS_KEY);
@@ -384,6 +379,7 @@ export function App(): React.ReactElement {
   }, []);
 
   useEffect(() => {
+    if (viewMode !== "app") return;
     let cancelled = false;
     void openSession(sessionUnlock(network), onMeasurement)
       .then(async (opened) => {
@@ -401,7 +397,7 @@ export function App(): React.ReactElement {
     return () => {
       cancelled = true;
     };
-  }, [onMeasurement, sessionEpoch]);
+  }, [onMeasurement, sessionEpoch, viewMode]);
 
   const run = async (label: string, action: (s: Session) => Promise<bigint | ExecutionResult | undefined>) => {
     if (session === undefined || busy) return;
@@ -600,236 +596,47 @@ export function App(): React.ReactElement {
   const totalRequiredStr = `${formatSol(totalRequiredNum)} ${selectedAsset}`;
   const chunksNeeded = Math.ceil(contractors.length / 14) || 1;
 
-  // Loading state
-  if (session === undefined || state === undefined) {
-    return (
-      <main className="app-container">
-        <header className="nav-header">
-          <div className="brand-wrap">
-            <div className="brand-logo">🛡️</div>
-            <span className="brand-text">Ciphra</span>
-            <span className="brand-pill">Confidential B2B</span>
-          </div>
-          <div className="network-pill">
-            <span className="pulse-dot" />
-            <span>{networkLabel}</span>
-          </div>
-        </header>
-
-        <div className="card-specular" style={{ textAlign: "center", padding: "4rem 2rem", margin: "3rem auto", maxWidth: "42rem" }}>
-          {error === "" ? (
-            <>
-              <div className="spinner" style={{ margin: "0 auto 1.5rem", width: "2.5rem", height: "2.5rem" }} />
-              <h2 style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: "0.5rem" }}>Initializing WASM Groth16 Prover</h2>
-              <p className="muted" style={{ fontSize: "0.875rem" }}>
-                Connecting to Solana Devnet via Helius RPC & Photon Indexer…
-              </p>
-            </>
-          ) : (
-            <div>
-              <div style={{ color: "var(--danger-primary)", fontSize: "1.25rem", fontWeight: 700, marginBottom: "0.75rem" }}>
-                Connection Error
-              </div>
-              <p style={{ color: "var(--text-secondary)", marginBottom: "1.75rem", wordBreak: "break-word", fontSize: "0.875rem" }}>
-                {error}
-              </p>
-              <div style={{ display: "flex", gap: "0.75rem", justifyContent: "center" }}>
-                <button className="btn btn-primary" onClick={() => location.reload()}>
-                  Retry Connection
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => {
-                    loadFundedDevnetSeed(network);
-                    location.reload();
-                  }}
-                >
-                  Load Funded Devnet Payer
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      </main>
-    );
-  }
-
-  const owner = session.signer.address;
-  const inboundHistory = state.history.filter((h) => h.direction === "inbound" || h.kind === "deposit");
-
-  const currentAssetConfig = ASSETS[selectedAsset];
-  const currentAssetData = state.assets?.[selectedAsset] ?? {
-    publicUnits: selectedAsset === "SOL" ? state.publicLamports : 0n,
-    privateUnits: selectedAsset === "SOL" ? state.privateLamports : 0n,
-    privateNotes: selectedAsset === "SOL" ? state.privateNotes : 0,
-    localSpendLimit: selectedAsset === "SOL" ? state.localSpendLimit : 0n,
-  };
-
-  const formatAssetUnits = (units: bigint, decimals: number, symbol: string) => {
-    return `${formatAmount(units, decimals)} ${symbol}`;
-  };
-
-  const formattedPrivate = formatAssetUnits(currentAssetData.privateUnits, currentAssetConfig.decimals, selectedAsset);
-  const formattedSpendLimit = formatAssetUnits(currentAssetData.localSpendLimit, currentAssetConfig.decimals, selectedAsset);
-  const formattedPublic = formatAssetUnits(currentAssetData.publicUnits, currentAssetConfig.decimals, selectedAsset);
-
-  return (
-    <main className="app-container">
-      {/* Top Navbar */}
-      <header className="nav-header">
-        <div className="brand-wrap" onClick={() => setViewMode("landing")}>
-          <div className="brand-logo">🛡️</div>
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-              <span className="brand-text">Ciphra</span>
-              <span className="brand-pill">Confidential B2B</span>
-            </div>
-          </div>
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap" }}>
-          <div className="network-pill">
-            <span className="pulse-dot" />
-            <span>{networkLabel}</span>
-          </div>
-
-          {/* Active Wallet Status & Switcher */}
-          <button
-            className="btn btn-secondary btn-sm"
-            style={{ display: "flex", alignItems: "center", gap: "0.4rem", borderColor: activeWalletInfo.isExternal ? "rgba(168, 85, 247, 0.45)" : undefined }}
-            onClick={() => setShowWalletModal(true)}
-            title="Wallet connection & network mode"
-          >
-            {activeWalletInfo.isExternal ? (
-              <>
-                <span style={{ color: "#C084FC" }}>🟣</span>
-                <span>{activeWalletInfo.name}: {owner.slice(0, 4)}…{owner.slice(-4)}</span>
-              </>
-            ) : (
-              <>
-                <span style={{ color: "#34D399" }}>⚡</span>
-                <span>{hasFundedDevnetPayer() ? `Demo Payer (${owner.slice(0, 4)}…${owner.slice(-4)})` : `Burner (${owner.slice(0, 4)}…${owner.slice(-4)})`}</span>
-              </>
-            )}
-          </button>
-
-          {!activeWalletInfo.isExternal && (
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={() => setShowWalletModal(true)}
-              style={{ background: "linear-gradient(135deg, #8B5CF6 0%, #6366F1 100%)", border: "none" }}
-              title="Connect Phantom or Solflare browser wallet"
-            >
-              Connect Phantom / Solflare
-            </button>
-          )}
-
-          {viewMode === "landing" ? (
-            <>
-              <button
-                className="btn btn-secondary btn-sm"
-                onClick={() => {
-                  setViewMode("app");
-                  setActiveTab("verify");
-                }}
-              >
-                Verify Receipt
-              </button>
-              <button
-                className="btn btn-primary btn-sm"
-                onClick={() => {
-                  setViewMode("app");
-                  setActiveTab("payroll");
-                }}
-              >
-                Open Payroll App →
-              </button>
-            </>
-          ) : (
-            <>
-              <button
-                className="btn btn-secondary btn-sm"
-                onClick={() => setViewMode("landing")}
-              >
-                ← Overview
-              </button>
-              {hasFundedDevnetPayer() && (
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => {
-                    loadFundedDevnetSeed(network);
-                    location.reload();
-                  }}
-                  title="Switch to funded payer keypair"
-                >
-                  Load Funded Payer
-                </button>
-              )}
-              <button
-                className="btn btn-secondary btn-sm"
-                onClick={() => {
-                  resetBurner(network);
-                  location.reload();
-                }}
-                title="Generate fresh testing keypair"
-              >
-                Reset Key
-              </button>
-            </>
-          )}
-        </div>
-      </header>
-
-      {/* ========================================================
-          FLAGSHIP LANDING VIEW
-          ======================================================== */}
-      {viewMode === "landing" && (
+  const landingView = <>
         <section className="hero-section">
-          {/* Eyebrow */}
-          <div className="hero-eyebrow">
-            <span>🛡️</span>
-            <span>BUILT ON SOLANA PRIVACY RINGS · GROTH16 IN-BROWSER PROVING</span>
-          </div>
-
-          {/* Headline */}
+          <p className="section-kicker">Solana confidential payroll</p>
           <h1 className="hero-headline">
-            Run onchain payroll without leaking your company's burn rate.
+            Private payroll<br />
+            <em>for a public chain.</em>
           </h1>
-
-          {/* Subheadline */}
           <p className="hero-subheadline">
-            Encrypt contractor salaries and shielded treasury balances, reduce timing-pattern correlation via staggered dispatch jitter, and generate 1-click cryptographic tax receipts—all in a single zero-knowledge proof.
+            Pay contractors without publishing salaries, recipients, or the company burn rate. Proofs run in the browser. A paystub opens one note. A batch audit opens the rest, on purpose.
           </p>
-
-          {/* CTAs */}
           <div className="hero-actions">
             <button
               className="btn btn-primary"
-              style={{ padding: "0.85rem 1.75rem", fontSize: "1rem" }}
               onClick={() => {
                 setViewMode("app");
                 setActiveTab("payroll");
               }}
             >
-              Launch Live Devnet App →
+              Open the desk
             </button>
             <button
               className="btn btn-secondary"
-              style={{ padding: "0.85rem 1.5rem", fontSize: "1rem" }}
               onClick={() => {
                 setViewMode("app");
                 setActiveTab("verify");
               }}
             >
-              🔍 Verify an Audit Receipt
+              Verify a receipt
             </button>
           </div>
+        </section>
 
-          {/* Hero Trust Badge */}
-          <div className="hero-trust-badge">
-            <span>🛡️</span>
-            <span>Built on Solana Privacy Rings (@heliuslabs/spr) · Groth16 proofs in the browser</span>
+        <div className="rail" aria-hidden="true">
+          <div className="rail-track">
+            {["Shielded notes", "Groth16", "One-note paystub", "Batch audit", "SOL", "USDC", "Nullifiers", "Client-side decrypt", "Shielded notes", "Groth16", "One-note paystub", "Batch audit", "SOL", "USDC", "Nullifiers", "Client-side decrypt"].map((item, index) => (
+              <span key={`${item}-${index}`}>{item}</span>
+            ))}
           </div>
+        </div>
+
+        <section className="hero-section" style={{ paddingTop: 0 }}>
 
           {/* ========================================================
               VIRAL ON-CHAIN TREASURY LEAK SCANNER
@@ -1113,49 +920,249 @@ export function App(): React.ReactElement {
             </div>
           </div>
 
-          {/* 3-Column Bento Features Grid */}
-          <div className="bento-grid">
-            <div className="card-specular bento-card">
+        </section>
+
+        <section>
+          <p className="section-kicker">The product</p>
+          <h2 className="section-title">Better rails for a payment that should stay quiet.</h2>
+          <div className="product-list">
+            <article className="product-row">
+              <span className="product-index">01</span>
               <div>
-                <div className="bento-icon-wrap">⚡</div>
-                <h3 className="bento-title">Multi-recipient Groth16 payroll</h3>
-                <p className="bento-desc">
-                  Each run calls buildMultiTransferTransaction. This desk puts at most 14 contractors plus the protocol fee in one call (15 payments). Proving keys pad outputs to 2, 4, 8, or 16 slots.
+                <h3>Payroll</h3>
+                <p>
+                  One call to buildMultiTransferTransaction. Up to 14 contractors plus the protocol fee. The proof hides amounts and recipients. Proving stays on this device until you opt into a remote merge.
                 </p>
               </div>
+              <button className="btn btn-secondary" type="button" onClick={() => { setViewMode("app"); setActiveTab("payroll"); }}>
+                Open
+              </button>
+            </article>
+            <article className="product-row">
+              <span className="product-index">02</span>
               <div>
-                <span className="bento-tag">15 PAYMENTS · SHAPES 2/4/8/16</span>
+                <h3>Paystub</h3>
+                <p>
+                  A contractor decrypts their own note in their own browser. The 32-byte viewing key opens every incoming note, so it never leaves that machine.
+                </p>
+              </div>
+              <button className="btn btn-secondary" type="button" onClick={() => { setViewMode("app"); setActiveTab("verify"); }}>
+                Verify
+              </button>
+            </article>
+            <article className="product-row">
+              <span className="product-index">03</span>
+              <div>
+                <h3>Exposure</h3>
+                <p>
+                  A public Solana treasury already prints salaries, recipients, and cadence. Scan one address and see the leak before you shield the next run.
+                </p>
+              </div>
+              <button className="btn btn-secondary" type="button" onClick={() => { setScannerInput(SAMPLE_DAO_TREASURY); void handleScanExposure(SAMPLE_DAO_TREASURY); }}>
+                Scan
+              </button>
+            </article>
+          </div>
+          <footer className="site-footer">
+            <span>Ciphra</span>
+            <span>Solana Privacy Rings · proofs in the browser</span>
+          </footer>
+        </section>
+        </>;
+
+  // Loading state
+  if (session === undefined || state === undefined) {
+    return (
+      <main className="app-container">
+        <header className="nav-header">
+          <div className="brand-wrap" onClick={() => setViewMode("landing")}>
+            <span className="brand-text">Ciphra</span>
+            <span className="brand-pill">Confidential payroll</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap" }}>
+            <div className="network-pill">
+              <span>{networkLabel}</span>
+            </div>
+            <button className="btn btn-secondary btn-sm" type="button" onClick={() => { setViewMode("app"); setActiveTab("verify"); }}>
+              Verify a receipt
+            </button>
+            <button className="btn btn-primary btn-sm" type="button" onClick={() => { setViewMode("app"); setActiveTab("payroll"); }}>
+              Open the desk
+            </button>
+          </div>
+        </header>
+        {viewMode === "landing" ? landingView : (
+        <div className="card-specular" style={{ textAlign: "center", padding: "4rem 2rem", margin: "3rem auto", maxWidth: "42rem" }}>
+          {error === "" ? (
+            <>
+              <div className="spinner" style={{ margin: "0 auto 1.5rem", width: "2.5rem", height: "2.5rem" }} />
+              <h2 style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: "0.5rem" }}>Initializing WASM Groth16 Prover</h2>
+              <p className="muted" style={{ fontSize: "0.875rem" }}>
+                Connecting to Solana Devnet via Helius RPC & Photon Indexer…
+              </p>
+            </>
+          ) : (
+            <div>
+              <div style={{ color: "var(--danger-primary)", fontSize: "1.25rem", fontWeight: 700, marginBottom: "0.75rem" }}>
+                Connection Error
+              </div>
+              <p style={{ color: "var(--text-secondary)", marginBottom: "1.75rem", wordBreak: "break-word", fontSize: "0.875rem" }}>
+                {error}
+              </p>
+              <div style={{ display: "flex", gap: "0.75rem", justifyContent: "center" }}>
+                <button className="btn btn-secondary" type="button" onClick={() => setViewMode("landing")}>
+                  Back
+                </button>
+                <button className="btn btn-primary" onClick={() => location.reload()}>
+                  Retry Connection
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    loadFundedDevnetSeed(network);
+                    location.reload();
+                  }}
+                >
+                  Load Funded Devnet Payer
+                </button>
               </div>
             </div>
+          )}
+        </div>
+        )}
+      </main>
+    );
+  }
 
-            <div className="card-specular bento-card">
-              <div>
-                <div className="bento-icon-wrap">⏱️</div>
-                <h3 className="bento-title">Anti-Correlation Timing Jitter</h3>
-                <p className="bento-desc">
-                  Injects randomized 2s–6s dispatch delays to reduce timing-pattern correlation between payout batches that could otherwise reveal 1st-of-the-month cycles.
-                </p>
-              </div>
-              <div>
-                <span className="bento-tag">TIMING CORRELATION REDUCTION</span>
-              </div>
-            </div>
+  const owner = session.signer.address;
+  const inboundHistory = state.history.filter((h) => h.direction === "inbound" || h.kind === "deposit");
 
-            <div className="card-specular bento-card">
-              <div>
-                <div className="bento-icon-wrap">📜</div>
-                <h3 className="bento-title">Selective Disclosure Receipts</h3>
-                <p className="bento-desc">
-                  Generate instant cryptographic proofs of disbursement for corporate tax audits without revealing company reserves or other salaries.
-                </p>
-              </div>
-              <div>
-                <span className="bento-tag">COMPLIANT ZERO-KNOWLEDGE</span>
-              </div>
+  const currentAssetConfig = ASSETS[selectedAsset];
+  const currentAssetData = state.assets?.[selectedAsset] ?? {
+    publicUnits: selectedAsset === "SOL" ? state.publicLamports : 0n,
+    privateUnits: selectedAsset === "SOL" ? state.privateLamports : 0n,
+    privateNotes: selectedAsset === "SOL" ? state.privateNotes : 0,
+    localSpendLimit: selectedAsset === "SOL" ? state.localSpendLimit : 0n,
+  };
+
+  const formatAssetUnits = (units: bigint, decimals: number, symbol: string) => {
+    return `${formatAmount(units, decimals)} ${symbol}`;
+  };
+
+  const formattedPrivate = formatAssetUnits(currentAssetData.privateUnits, currentAssetConfig.decimals, selectedAsset);
+  const formattedSpendLimit = formatAssetUnits(currentAssetData.localSpendLimit, currentAssetConfig.decimals, selectedAsset);
+  const formattedPublic = formatAssetUnits(currentAssetData.publicUnits, currentAssetConfig.decimals, selectedAsset);
+
+  return (
+    <main className="app-container">
+      {/* Top Navbar */}
+      <header className="nav-header">
+        <div className="brand-wrap" onClick={() => setViewMode("landing")}>
+          <div className="brand-logo">🛡️</div>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              <span className="brand-text">Ciphra</span>
+              <span className="brand-pill">Confidential B2B</span>
             </div>
           </div>
-        </section>
-      )}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap" }}>
+          <div className="network-pill">
+            <span className="pulse-dot" />
+            <span>{networkLabel}</span>
+          </div>
+
+          {/* Active Wallet Status & Switcher */}
+          <button
+            className="btn btn-secondary btn-sm"
+            style={{ display: "flex", alignItems: "center", gap: "0.4rem", borderColor: activeWalletInfo.isExternal ? "rgba(168, 85, 247, 0.45)" : undefined }}
+            onClick={() => setShowWalletModal(true)}
+            title="Wallet connection & network mode"
+          >
+            {activeWalletInfo.isExternal ? (
+              <>
+                <span style={{ color: "#C084FC" }}>🟣</span>
+                <span>{activeWalletInfo.name}: {owner.slice(0, 4)}…{owner.slice(-4)}</span>
+              </>
+            ) : (
+              <>
+                <span style={{ color: "#34D399" }}>⚡</span>
+                <span>{hasFundedDevnetPayer() ? `Demo Payer (${owner.slice(0, 4)}…${owner.slice(-4)})` : `Burner (${owner.slice(0, 4)}…${owner.slice(-4)})`}</span>
+              </>
+            )}
+          </button>
+
+          {!activeWalletInfo.isExternal && (
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => setShowWalletModal(true)}
+              title="Connect Phantom or Solflare browser wallet"
+            >
+              Connect Phantom / Solflare
+            </button>
+          )}
+
+          {viewMode === "landing" ? (
+            <>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => {
+                  setViewMode("app");
+                  setActiveTab("verify");
+                }}
+              >
+                Verify Receipt
+              </button>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => {
+                  setViewMode("app");
+                  setActiveTab("payroll");
+                }}
+              >
+                Open Payroll App →
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => setViewMode("landing")}
+              >
+                ← Overview
+              </button>
+              {hasFundedDevnetPayer() && (
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => {
+                    loadFundedDevnetSeed(network);
+                    location.reload();
+                  }}
+                  title="Switch to funded payer keypair"
+                >
+                  Load Funded Payer
+                </button>
+              )}
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => {
+                  resetBurner(network);
+                  location.reload();
+                }}
+                title="Generate fresh testing keypair"
+              >
+                Reset Key
+              </button>
+            </>
+          )}
+        </div>
+      </header>
+
+      {/* ========================================================
+          FLAGSHIP LANDING VIEW
+          ======================================================== */}
+      {viewMode === "landing" && landingView}
 
       {/* ========================================================
           UPGRADED APP WORKSPACE VIEW
