@@ -6,7 +6,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { burnerStorageKey } from "../src/burner.ts";
 import {
   appendTransactionMessageInstruction,
   createKeyPairSignerFromBytes,
@@ -117,10 +116,15 @@ const driver = await new Builder().forBrowser("chrome").setChromeOptions(options
 let funded = false;
 
 try {
+  // Inject the burner into the page heap before scripts run. The app copies it
+  // into memory and does not read it back from localStorage or sessionStorage.
+  await (driver as WebDriver & {
+    sendDevToolsCommand(command: string, params?: Record<string, unknown>): Promise<unknown>;
+  }).sendDevToolsCommand("Page.addScriptToEvaluateOnNewDocument", {
+    source: `window.__ciphraE2ESeed=${JSON.stringify(seedHex)};`,
+  });
   // The page must start before any SOL moves, so a broken build costs nothing.
   await driver.get("http://127.0.0.1:5179/");
-  await driver.executeScript("localStorage.setItem(arguments[0], arguments[1])", burnerStorageKey("devnet"), seedHex);
-  await driver.navigate().refresh();
   await driver.wait(until.elementLocated(byTestId("owner")), 120_000);
   assert.equal(await driver.findElement(byTestId("owner")).getText(), burner.address);
   assert.equal(await driver.executeScript("return crossOriginIsolated"), true);

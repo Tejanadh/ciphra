@@ -2,7 +2,9 @@ import "./polyfill.js";
 import {
   LocalKeys,
   MergeEncryptionScheme,
+  SHIELDED_POOL_PROGRAM_ID,
   SOL_MINT,
+  ViewingKey,
   Wallet,
   buildDepositTransaction,
   buildMultiTransferTransaction,
@@ -18,9 +20,19 @@ import {
   syncWallet,
   type Bytes32,
   type ShieldedAddress,
+  type Signature,
   type TransferPayment as Payment,
+  type WalletUtxo,
 } from "@heliuslabs/spr";
 export { SOL_MINT };
+import { MAX_MERGE_INPUTS } from "@heliuslabs/spr/interface";
+import { X25519PublicKey, bytes32 } from "@heliuslabs/spr/keypair";
+import {
+  EncryptedScheme,
+  decodeConfidential,
+  decodeOutputData,
+  type IndexedShieldedTransaction,
+} from "@heliuslabs/spr/transaction";
 import { getAssociatedTokenAddress } from "@heliuslabs/spr/addresses";
 import { backfillAssetRegistry, fetchUserRecord } from "@heliuslabs/spr/wallet";
 import { ed25519DerivationMessage } from "@heliuslabs/spr/keypair";
@@ -39,6 +51,7 @@ import {
   getBase58Encoder,
   getSignatureFromTransaction,
   isAddress,
+  isKeyPairSigner,
   pipe,
   sendTransactionWithoutConfirmingFactory,
   setTransactionMessageFeePayerSigner,
@@ -48,11 +61,13 @@ import {
   type Address,
   type KeyPairSigner,
   type Transaction,
+  type TransactionPartialSigner,
 } from "@solana/kit";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { SprWebProver, type Measurement } from "@heliuslabs/spr-web-prover";
+import { signConnectedWalletMessage, type WalletSessionUnlock } from "./burner.js";
 import { deployments, remoteProverConfig, sprEndpoints } from "./deployments";
-import { limitLocalProofs, localSpendLimit, MERGE_FIRST } from "./local-proving.js";
+import { MAX_LOCAL_INPUTS, limitLocalProofs, localSpendLimit, MERGE_FIRST } from "./local-proving.js";
 export type { Payment };
 
 const selectedNetwork: string = import.meta.env.VITE_ZOLANA_NETWORK ?? "devnet";
@@ -126,11 +141,13 @@ export function getWalletAssetBalance(wallet: Wallet, mint: Address) {
   }
 }
 
+export type SessionSigner = KeyPairSigner | TransactionPartialSigner;
+
 export interface Session {
   readonly prover: SprWebProver;
   readonly client: Client;
   readonly mergeClient: Client;
-  readonly signer: KeyPairSigner;
+  readonly signer: SessionSigner;
   readonly keys: LocalKeys;
   readonly mergeKeys: LocalKeys;
   readonly wallet: Wallet;
@@ -159,7 +176,19 @@ export interface Snapshot {
  * Proofs are made by the prover's worker: the client's `fetch` answers its
  * `/prove/<key>` requests locally, and everything else goes to the network.
  */
-export async function openSession(seed: Uint8Array, onMeasurement: (m: Measurement) => void): Promise<Session> {
+function wipe(bytes: Uint8Array): void {
+  bytes.fill(0);
+}
+
+/**
+ * Derives shielded keys with `LocalKeys.fromDerivationSeed`.
+ * A 32-byte local key signs `ed25519DerivationMessage` here.
+ * A connected wallet passes the 64-byte signature it already produced over that message.
+ */
+export async function openSession(
+  material: Uint8Array | WalletSessionUnlock,
+  onMeasurement: (m: Measurement) => void,
+): Promise<Session> {
   const prover = new SprWebProver({
     proverUrl: endpoints.proverUrl,
     onMeasurement,
@@ -176,14 +205,37 @@ export async function openSession(seed: Uint8Array, onMeasurement: (m: Measureme
     ...endpoints,
     ...remoteProver,
   });
-  const signer = await createKeyPairSignerFromPrivateKeyBytes(seed);
-  // The keys derive from the owner's signature over the Solana off-chain
-  // message the SDK defines; a wallet would produce it with signMessage.
-  const publicKey = new Uint8Array(getAddressEncoder().encode(signer.address)) as Bytes32;
-  const derivationSeed = await signBytes(signer.keyPair.privateKey, ed25519DerivationMessage(publicKey));
-  const keys = LocalKeys.fromDerivationSeed({ solanaPublicKey: signer.address, derivationSeed }, client.proofService);
-  const mergeKeys = LocalKeys.fromDerivationSeed({ solanaPublicKey: signer.address, derivationSeed }, mergeClient.proofService);
-  derivationSeed.fill(0);
+
+  let signer: SessionSigner;
+  let ownedSeed: Uint8Array;
+  if (material instanceof Uint8Array) {
+    const local = await createKeyPairSignerFromPrivateKeyBytes(material);
+    signer = local;
+    const publicKey = new Uint8Array(getAddressEncoder().encode(local.address)) as Bytes32;
+    ownedSeed = await signBytes(local.keyPair.privateKey, ed25519DerivationMessage(publicKey));
+  } else {
+    signer = material.signer;
+    ownedSeed = new Uint8Array(material.derivationSeed);
+  }
+  const solanaPublicKey = signer.address;
+  const forClient = new Uint8Array(ownedSeed);
+  const forMerge = new Uint8Array(ownedSeed);
+  wipe(ownedSeed);
+  let keys: LocalKeys;
+  let mergeKeys: LocalKeys;
+  try {
+    keys = LocalKeys.fromDerivationSeed({ solanaPublicKey, derivationSeed: forClient }, client.proofService);
+    mergeKeys = LocalKeys.fromDerivationSeed({ solanaPublicKey, derivationSeed: forMerge }, mergeClient.proofService);
+  } finally {
+    wipe(forClient);
+    wipe(forMerge);
+  }
+  if (typeof window !== "undefined") {
+    window.addEventListener("pagehide", () => {
+      keys.destroy();
+      mergeKeys.destroy();
+    }, { once: true });
+  }
   const shieldedAddress = keys.address();
   return { prover, client, mergeClient, signer, keys, mergeKeys, wallet: new Wallet({ identity: shieldedAddress }), shieldedAddress };
 }
@@ -360,6 +412,9 @@ export const actions = {
   },
   async mintDevnetTestUsdc(session: Session, amountTokens: number = 10000): Promise<ExecutionResult> {
     const { client, signer } = session;
+    if (!isKeyPairSigner(signer)) {
+      throw new Error("Devnet USDC mint requires a local signing key.");
+    }
     const recipient = signer.address;
     const mint = USDC_MINT;
     const ata = await getAssociatedTokenAddress(recipient, mint);
@@ -391,6 +446,233 @@ export const actions = {
     return submit(session, transaction);
   },
 };
+
+const PAYROLL_JOURNAL_STORAGE_KEY = "ciphra_payroll_journal";
+const JOURNAL_RETRY_AFTER_MS = 180_000;
+const MAX_JOURNAL_RUNS = 20;
+
+export type PayrollChunkStatus = "pending" | "submitted" | "confirmed" | "failed";
+
+interface JournalRecipient {
+  readonly recipient: string;
+  readonly amountBaseUnits: string;
+  readonly memo: string;
+}
+
+interface JournalChunk {
+  readonly index: number;
+  readonly recipients: readonly JournalRecipient[];
+  readonly feeCollector: string;
+  readonly feeBaseUnits: string;
+  readonly feeBps: number;
+  status: PayrollChunkStatus;
+  signature?: string;
+  slot?: string;
+  error?: string;
+  submittedAt?: number;
+}
+
+interface JournalRun {
+  readonly runId: string;
+  readonly createdAt: number;
+  readonly network: string;
+  readonly asset: AssetSymbol;
+  readonly mint: string;
+  readonly decimals: number;
+  readonly protocolFeeBps: number;
+  readonly feeCollector: string;
+  readonly planKey: string;
+  readonly chunks: JournalChunk[];
+}
+
+function hexBytes(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
+  }
+  return difference === 0;
+}
+
+function errorText(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.slice(0, 500);
+}
+
+function readJournal(): JournalRun[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(PAYROLL_JOURNAL_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isJournalRun).slice(0, MAX_JOURNAL_RUNS);
+  } catch {
+    return [];
+  }
+}
+
+function writeJournal(runs: readonly JournalRun[]): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(
+    PAYROLL_JOURNAL_STORAGE_KEY,
+    JSON.stringify(runs.slice(0, MAX_JOURNAL_RUNS)),
+  );
+}
+
+function isJournalRun(value: unknown): value is JournalRun {
+  if (typeof value !== "object" || value === null) return false;
+  const run = value as JournalRun;
+  return typeof run.runId === "string"
+    && typeof run.planKey === "string"
+    && typeof run.mint === "string"
+    && Array.isArray(run.chunks);
+}
+
+function plainNotes(wallet: Wallet, asset: Address): WalletUtxo[] {
+  const reserved = wallet._reservedUtxoKeys(BigInt(Date.now()));
+  return wallet.utxos().filter((entry) => {
+    if (entry.spent || entry.utxo.asset !== asset || entry.utxo.amount <= 0n) return false;
+    if (entry.utxo.ringProgramId !== undefined || entry.ringDataHash !== undefined || entry.dataHash !== undefined) {
+      return false;
+    }
+    if (!entry.utxo.data.isEmpty()) return false;
+    return !reserved.has(hexBytes(entry.outputContext.hash));
+  });
+}
+
+/** Largest-first cover, the same order `selectUtxos` uses for a spend. */
+function notesToCover(wallet: Wallet, asset: Address, amount: bigint): WalletUtxo[] {
+  const sorted = [...plainNotes(wallet, asset)].sort((left, right) => (
+    left.utxo.amount > right.utxo.amount ? -1 : left.utxo.amount < right.utxo.amount ? 1 : 0
+  ));
+  const chosen: WalletUtxo[] = [];
+  let total = 0n;
+  for (const entry of sorted) {
+    chosen.push(entry);
+    total += entry.utxo.amount;
+    if (total >= amount) break;
+  }
+  return chosen;
+}
+
+async function submitAndIndex(
+  session: Session,
+  transaction: Transaction,
+  onSignature: (signature: string) => void,
+): Promise<ExecutionResult> {
+  const { client, signer } = session;
+  const signed = await signTransactionWithSigners([signer], transaction);
+  const signature = getSignatureFromTransaction(signed);
+  onSignature(signature);
+  await sendTransactionWithoutConfirmingFactory({ rpc: client.solanaRpc })(signed, {
+    commitment: client.commitment,
+  });
+  const slot = await client.confirmTransaction(signature);
+  await client.confirmPrivateTransaction(signature);
+  return { signature, slot };
+}
+
+async function syncUntilBalance(
+  session: Session,
+  asset: Address,
+  expected: bigint,
+  slot: bigint,
+  onProgress?: (message: string) => void,
+): Promise<void> {
+  const { client, wallet, keys } = session;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    onProgress?.(`Syncing shielded notes until the confirmed chunk is spendable (${attempt}/4)…`);
+    await syncWallet({ client, wallet, keys, config: { requireSlot: slot } });
+    await backfillAssetRegistry(wallet, client).catch(() => 0);
+    if (getWalletAssetBalance(wallet, asset).amount === expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  throw new Error(
+    "The chunk is confirmed, but its nullifiers or change note are not in the local wallet yet. Resume this payroll after sync. Confirmed chunks are not sent again.",
+  );
+}
+
+async function consolidateOrRemote(
+  session: Session,
+  asset: Address,
+  amount: bigint,
+  onProgress?: (message: string) => void,
+): Promise<"local" | "remote"> {
+  let cover = notesToCover(session.wallet, asset, amount);
+  if (cover.length <= MAX_LOCAL_INPUTS) return "local";
+  let attested = false;
+  for (let round = 0; round < 6 && cover.length > MAX_LOCAL_INPUTS; round += 1) {
+    if (cover.length < 2) break;
+    let submittedSlot: bigint;
+    let mergedInputs: readonly Bytes32[];
+    let beforeMerge: ReadonlySet<string>;
+    try {
+      if (!attested) {
+        await session.mergeClient.attestProver();
+        attested = true;
+      }
+      const record = await fetchUserRecord({ rpc: session.client, owner: session.signer.address });
+      if (record?.mergeEncryption !== MergeEncryptionScheme.PoseidonCtrV1) {
+        onProgress?.("Enabling merge encryption so fragmented notes can be consolidated…");
+        await actions.setMerging(session, true);
+      }
+      mergedInputs = cover.slice(0, MAX_MERGE_INPUTS).map((entry) => entry.outputContext.hash);
+      onProgress?.(
+        `Merging ${mergedInputs.length} notes (local proofs allow ${MAX_LOCAL_INPUTS} inputs, merge allows ${MAX_MERGE_INPUTS})…`,
+      );
+      beforeMerge = new Set(plainNotes(session.wallet, asset).map((entry) => hexBytes(entry.outputContext.hash)));
+      const transaction = await buildMergeTransaction({
+        client: session.mergeClient,
+        wallet: session.wallet,
+        keys: session.mergeKeys,
+        feePayer: session.signer.address,
+        asset,
+        inputs: mergedInputs,
+      });
+      const submitted = await submitAndIndex(session, transaction, () => undefined);
+      submittedSlot = submitted.slot;
+    } catch (error) {
+      onProgress?.(
+        `Merge did not finish (${errorText(error)}). This chunk will use the configured remote prover.`,
+      );
+      return "remote";
+    }
+    await syncUntilMerged(session, asset, mergedInputs, beforeMerge, submittedSlot, onProgress);
+    cover = notesToCover(session.wallet, asset, amount);
+  }
+  return cover.length <= MAX_LOCAL_INPUTS ? "local" : "remote";
+}
+
+async function syncUntilMerged(
+  session: Session,
+  asset: Address,
+  inputs: readonly Bytes32[],
+  before: ReadonlySet<string>,
+  slot: bigint,
+  onProgress?: (message: string) => void,
+): Promise<void> {
+  const spent = new Set(inputs.map((hash) => hexBytes(hash)));
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    onProgress?.(`Syncing the merge so the consolidated note can be spent (${attempt}/4)…`);
+    await syncWallet({
+      client: session.client,
+      wallet: session.wallet,
+      keys: session.keys,
+      config: { requireSlot: slot },
+    });
+    const notes = plainNotes(session.wallet, asset);
+    const inputStillSpendable = notes.some((entry) => spent.has(hexBytes(entry.outputContext.hash)));
+    const created = notes.some((entry) => !before.has(hexBytes(entry.outputContext.hash)));
+    if (!inputStillSpendable && created) return;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  throw new Error("The merge confirmed, but the consolidated note is not indexed yet.");
+}
 
 export interface PayrollRecipientInput {
   readonly recipient: string;
@@ -448,9 +730,51 @@ export interface BatchPayrollReport {
   readonly receiptCommitmentHash?: string | undefined;
 }
 
+function payrollPlanKey(mint: string, feeCollector: string, feeBps: number, chunks: readonly JournalChunk[]): string {
+  return JSON.stringify({
+    mint,
+    feeCollector,
+    feeBps,
+    chunks: chunks.map((chunk) => ({
+      recipients: chunk.recipients.map((recipient) => [recipient.recipient, recipient.amountBaseUnits]),
+      fee: chunk.feeBaseUnits,
+    })),
+  });
+}
+
+function chunkExecution(assetSymbol: AssetSymbol, decimals: number, chunk: JournalChunk): PayrollChunkExecution {
+  return {
+    chunkIndex: chunk.index,
+    txSignature: chunk.signature ?? "",
+    slot: chunk.slot ?? "",
+    timestamp: chunk.submittedAt ?? Date.now(),
+    payouts: chunk.recipients.map((recipient) => {
+      const units = BigInt(recipient.amountBaseUnits);
+      const amount = Number(units) / 10 ** decimals;
+      return {
+        recipient: recipient.recipient,
+        amount,
+        amountSol: amount,
+        amountBaseUnits: recipient.amountBaseUnits,
+        amountLamports: recipient.amountBaseUnits,
+        memo: recipient.memo || `Ciphra ${assetSymbol} Payroll`,
+      };
+    }),
+    protocolFee: {
+      collector: chunk.feeCollector,
+      amount: Number(BigInt(chunk.feeBaseUnits)) / 10 ** decimals,
+      amountSol: Number(BigInt(chunk.feeBaseUnits)) / 10 ** decimals,
+      amountBaseUnits: chunk.feeBaseUnits,
+      amountLamports: chunk.feeBaseUnits,
+      bps: chunk.feeBps,
+    },
+  };
+}
+
 /**
  * Executes batch payroll using buildMultiTransferTransaction.
  * Max 14 recipients per chunk to leave the 15th slot for the 0.25% protocol fee.
+ * A journal written before the first send skips chunks already confirmed on chain.
  */
 export async function runBatchPayroll(
   session: Session,
@@ -467,7 +791,7 @@ export async function runBatchPayroll(
   const assetConfig = ASSETS[assetSymbol];
   const { decimals, mint } = assetConfig;
   const {
-    protocolFeeBps = 25, // 0.25%
+    protocolFeeBps = 25,
     feeCollector = session.signer.address,
     antiCorrelationJitter = false,
     onProgress,
@@ -477,101 +801,193 @@ export async function runBatchPayroll(
     throw new Error("No recipients provided for payroll run");
   }
 
-  const getAmountNum = (r: PayrollRecipientInput) => Number(r.amount ?? r.amountSol ?? 0);
-
-  // Validate all recipient addresses upfront
-  for (const r of recipients) {
-    if (!isAddress(r.recipient.trim())) {
-      throw new Error(`Invalid Solana address: "${r.recipient}"`);
+  const getAmountNum = (recipient: PayrollRecipientInput) => Number(recipient.amount ?? recipient.amountSol ?? 0);
+  for (const recipient of recipients) {
+    if (!isAddress(recipient.recipient.trim())) {
+      throw new Error(`Invalid Solana address: "${recipient.recipient}"`);
     }
-    const amt = getAmountNum(r);
+    const amt = getAmountNum(recipient);
     if (amt <= 0) {
-      throw new Error(`Invalid amount ${amt} ${assetSymbol} for recipient ${r.recipient}`);
+      throw new Error(`Invalid amount ${amt} ${assetSymbol} for recipient ${recipient.recipient}`);
     }
   }
 
-  // Total amount needed in base units
-  const totalAmount = recipients.reduce((sum, r) => sum + getAmountNum(r), 0);
+  const totalAmount = recipients.reduce((sum, recipient) => sum + getAmountNum(recipient), 0);
   const totalBaseUnits = parseAmount(totalAmount.toFixed(decimals), decimals);
   const totalFeeBaseUnits = (totalBaseUnits * BigInt(protocolFeeBps)) / 10000n;
   const overallNeeded = totalBaseUnits + totalFeeBaseUnits;
 
-  checkLocalAmount(session.wallet, overallNeeded, mint);
+  onProgress?.("Syncing shielded notes before payroll…");
+  await syncWallet({ client: session.client, wallet: session.wallet, keys: session.keys });
+  await backfillAssetRegistry(session.wallet, session.client).catch(() => 0);
+  const available = getWalletAssetBalance(session.wallet, mint).amount;
+  if (overallNeeded > available) throw new Error("Insufficient private balance");
 
   const MAX_RECIPIENTS_PER_CHUNK = 14;
   const chunked: PayrollRecipientInput[][] = [];
-  for (let i = 0; i < recipients.length; i += MAX_RECIPIENTS_PER_CHUNK) {
-    chunked.push(recipients.slice(i, i + MAX_RECIPIENTS_PER_CHUNK));
+  for (let index = 0; index < recipients.length; index += MAX_RECIPIENTS_PER_CHUNK) {
+    chunked.push(recipients.slice(index, index + MAX_RECIPIENTS_PER_CHUNK));
   }
 
-  const chunks: PayrollChunkExecution[] = [];
-  const runId = `CIPHRA-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+  const planned: JournalChunk[] = chunked.map((chunk, index) => {
+    const chunkBaseUnits = parseAmount(
+      chunk.reduce((sum, recipient) => sum + getAmountNum(recipient), 0).toFixed(decimals),
+      decimals,
+    );
+    return {
+      index,
+      recipients: chunk.map((recipient) => ({
+        recipient: recipient.recipient.trim(),
+        amountBaseUnits: parseAmount(getAmountNum(recipient).toFixed(decimals), decimals).toString(),
+        memo: recipient.memo || `Ciphra ${assetSymbol} Payroll`,
+      })),
+      feeCollector: feeCollector.trim(),
+      feeBaseUnits: ((chunkBaseUnits * BigInt(protocolFeeBps)) / 10000n).toString(),
+      feeBps: protocolFeeBps,
+      status: "pending",
+    };
+  });
+  const planKey = payrollPlanKey(mint.toString(), feeCollector.trim(), protocolFeeBps, planned);
+  const stored = readJournal();
+  const existing = stored.find((run) => (
+    run.planKey === planKey && run.chunks.some((chunk) => chunk.status !== "confirmed")
+  ));
+  const journal: JournalRun = existing ?? {
+    runId: `CIPHRA-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
+    createdAt: Date.now(),
+    network,
+    asset: assetSymbol,
+    mint: mint.toString(),
+    decimals,
+    protocolFeeBps,
+    feeCollector: feeCollector.trim(),
+    planKey,
+    chunks: planned,
+  };
+  const persist = () => {
+    const others = readJournal().filter((run) => run.runId !== journal.runId);
+    writeJournal([journal, ...others]);
+  };
+  persist();
 
-  for (let idx = 0; idx < chunked.length; idx++) {
-    const chunk = chunked[idx]!;
-    if (idx > 0 && antiCorrelationJitter) {
+  const executed: PayrollChunkExecution[] = [];
+  for (const chunk of journal.chunks) {
+    if (chunk.status === "confirmed" && chunk.signature) {
+      const signature = chunk.signature;
+      try {
+        await assertShieldedTransaction(session, signature);
+      } catch (error) {
+        if (error instanceof SettledTransactionFailed) {
+          chunk.status = "failed";
+          chunk.error = errorText(error);
+          persist();
+        } else {
+          persist();
+          throw new Error(
+            `Batch ${chunk.index + 1} is marked confirmed (${signature}) but could not be re-read. It was not sent again. ${errorText(error)}`,
+          );
+        }
+      }
+      if (chunk.status === "confirmed") {
+        onProgress?.(`Skipping confirmed batch ${chunk.index + 1}. Signature ${signature}.`);
+        executed.push(chunkExecution(assetSymbol, decimals, chunk));
+        continue;
+      }
+    }
+
+    if (chunk.status === "submitted" && chunk.signature) {
+      const age = Date.now() - (chunk.submittedAt ?? journal.createdAt);
+      try {
+        const settled = await readSettledTransaction(session, chunk.signature);
+        chunk.status = "confirmed";
+        chunk.slot = settled.slot;
+        persist();
+        onProgress?.(`Batch ${chunk.index + 1} was already confirmed. Skipping it.`);
+        executed.push(chunkExecution(assetSymbol, decimals, chunk));
+        continue;
+      } catch (error) {
+        if (age < JOURNAL_RETRY_AFTER_MS) {
+          chunk.error = errorText(error);
+          persist();
+          throw new Error(
+            `Batch ${chunk.index + 1} was submitted as ${chunk.signature} and is not confirmed. It was not sent again. Resume after it lands or expires.`,
+          );
+        }
+        chunk.status = "failed";
+        chunk.error = errorText(error);
+        persist();
+      }
+    }
+
+    if (chunk.index > 0 && antiCorrelationJitter) {
       const jitterMs = 2000 + Math.floor(Math.random() * 4000);
-      onProgress?.(`Anti-correlation jitter: waiting ${(jitterMs / 1000).toFixed(1)}s before batch ${idx + 1}/${chunked.length}…`);
-      await new Promise((res) => setTimeout(res, jitterMs));
+      onProgress?.(`Anti-correlation jitter: waiting ${(jitterMs / 1000).toFixed(1)}s before batch ${chunk.index + 1}/${journal.chunks.length}…`);
+      await new Promise((resolve) => setTimeout(resolve, jitterMs));
     }
 
-    onProgress?.(`Proving & executing ${assetSymbol} batch ${idx + 1} of ${chunked.length} (${chunk.length} contractors)…`);
-
-    const chunkTotal = chunk.reduce((sum, r) => sum + getAmountNum(r), 0);
-    const chunkBaseUnits = parseAmount(chunkTotal.toFixed(decimals), decimals);
-    const chunkFeeBaseUnits = (chunkBaseUnits * BigInt(protocolFeeBps)) / 10000n;
-
-    const payments: Payment[] = chunk.map((c) => ({
-      recipient: address(c.recipient.trim()),
-      amount: parseAmount(getAmountNum(c).toFixed(decimals), decimals),
+    const payments: Payment[] = chunk.recipients.map((recipient) => ({
+      recipient: address(recipient.recipient),
+      amount: BigInt(recipient.amountBaseUnits),
     }));
+    const fee = BigInt(chunk.feeBaseUnits);
+    if (fee > 0n) payments.push({ recipient: address(chunk.feeCollector), amount: fee });
+    const spent = payments.reduce((sum, payment) => sum + payment.amount, 0n);
+    // A payment back to the signer, including the default protocol fee, stays in this wallet.
+    const leaving = payments.reduce((sum, payment) => (
+      payment.recipient === session.signer.address ? sum : sum + payment.amount
+    ), 0n);
+    const balanceBefore = getWalletAssetBalance(session.wallet, mint).amount;
 
-    if (chunkFeeBaseUnits > 0n) {
-      payments.push({
-        recipient: address(feeCollector.trim()),
-        amount: chunkFeeBaseUnits,
+    try {
+      const route = await consolidateOrRemote(session, mint, spent, onProgress);
+      const provingClient = route === "remote" ? session.mergeClient : session.client;
+      const provingKeys = route === "remote" ? session.mergeKeys : session.keys;
+      if (route === "remote") {
+        onProgress?.(`Proving batch ${chunk.index + 1} on the remote prover (${notesToCover(session.wallet, mint, spent).length} inputs).`);
+        await session.mergeClient.attestProver();
+      } else {
+        checkLocalAmount(session.wallet, spent, mint);
+        onProgress?.(`Proving batch ${chunk.index + 1} of ${journal.chunks.length} in the browser (${chunk.recipients.length} contractors)…`);
+      }
+      const transaction = await buildMultiTransferTransaction({
+        client: provingClient,
+        wallet: session.wallet,
+        keys: provingKeys,
+        feePayer: session.signer.address,
+        payments,
+        ...(mint === SOL_MINT ? {} : { asset: mint }),
       });
+      const result = await submitAndIndex(session, transaction, (signature) => {
+        chunk.status = "submitted";
+        chunk.signature = signature;
+        chunk.submittedAt = Date.now();
+        delete chunk.error;
+        persist();
+      });
+      chunk.status = "confirmed";
+      chunk.slot = result.slot.toString();
+      chunk.signature = result.signature;
+      persist();
+      await syncUntilBalance(session, mint, balanceBefore - leaving, result.slot, onProgress);
+      executed.push(chunkExecution(assetSymbol, decimals, chunk));
+    } catch (error) {
+      if (chunk.status !== "submitted" && chunk.status !== "confirmed") {
+        chunk.status = "failed";
+      }
+      chunk.error = errorText(error);
+      persist();
+      throw error;
     }
-
-    const { signature, slot } = await actions.pay(session, payments, mint);
-
-    chunks.push({
-      chunkIndex: idx,
-      txSignature: signature,
-      slot: slot.toString(),
-      timestamp: Date.now(),
-      payouts: chunk.map((c) => {
-        const amt = getAmountNum(c);
-        const bu = parseAmount(amt.toFixed(decimals), decimals).toString();
-        return {
-          recipient: c.recipient.trim(),
-          amount: amt,
-          amountSol: amt,
-          amountBaseUnits: bu,
-          amountLamports: bu,
-          memo: c.memo || `Ciphra ${assetSymbol} Payroll`,
-        };
-      }),
-      protocolFee: {
-        collector: feeCollector.trim(),
-        amount: Number(chunkFeeBaseUnits) / 10 ** decimals,
-        amountSol: Number(chunkFeeBaseUnits) / 10 ** decimals,
-        amountBaseUnits: chunkFeeBaseUnits.toString(),
-        amountLamports: chunkFeeBaseUnits.toString(),
-        bps: protocolFeeBps,
-      },
-    });
   }
 
   const totalFeeNum = Number(totalFeeBaseUnits) / 10 ** decimals;
-
   return {
-    id: runId,
+    id: journal.runId,
     protocol: "Ciphra",
     version: "1.0",
     network,
-    timestamp: Date.now(),
-    formattedDate: new Date().toISOString(),
+    timestamp: journal.createdAt,
+    formattedDate: new Date(journal.createdAt).toISOString(),
     asset: assetSymbol,
     mint: mint.toString(),
     decimals,
@@ -583,12 +999,37 @@ export async function runBatchPayroll(
     totalLamports: overallNeeded.toString(),
     antiCorrelationJitter,
     contractorCount: recipients.length,
-    chunks,
+    chunks: executed,
   };
+}
+
+export type VerifyAuditMode = "paystub" | "employer";
+
+export interface VerifyAuditOptions {
+  readonly mode: VerifyAuditMode;
+  /** 32-byte viewing-key secret. The caller wipes this buffer. */
+  readonly viewingKey?: Uint8Array;
+  /** Use the connected session. Paystub mode calls `decrypt`. Employer mode derives `transactionViewingKey`. */
+  readonly useSessionKey?: boolean;
+}
+
+export interface DecryptedNote {
+  readonly signature: string;
+  readonly slotIndex: number;
+  readonly mint: string;
+  readonly assetId: string;
+  readonly amountBaseUnits: string;
+  readonly amountDisplay: string;
+  readonly role: "recipient" | "sender-change" | "opened-note";
+  readonly recipientViewingKey: string;
 }
 
 export interface VerificationResult {
   readonly valid: boolean;
+  readonly mode: VerifyAuditMode;
+  readonly integrity: "VERIFIED" | "TAMPERED";
+  readonly tamperReason?: string;
+  readonly decryptedOutputs: readonly DecryptedNote[];
   readonly txSignature: string;
   readonly slot: string;
   readonly network: string;
@@ -695,26 +1136,17 @@ export async function signReceiptCommitment(
   const hashBytes = new TextEncoder().encode(commitmentHash);
 
   let signatureBytes: Uint8Array | undefined;
-  const win = typeof window !== "undefined" ? (window as any) : undefined;
-  const externalType = typeof localStorage !== "undefined" ? localStorage.getItem("ciphra_wallet_type") : null;
-
-  if (externalType === "phantom" && win?.phantom?.solana?.signMessage) {
-    try {
-      const res = await win.phantom.solana.signMessage(hashBytes, "utf8");
-      signatureBytes = res?.signature || res;
-    } catch {
-      // Fallback to session keypair
-    }
-  } else if (externalType === "solflare" && win?.solflare?.signMessage) {
-    try {
-      const res = await win.solflare.signMessage(hashBytes, "utf8");
-      signatureBytes = res?.signature || res;
-    } catch {
-      // Fallback to session keypair
-    }
+  try {
+    const external = await signConnectedWalletMessage(hashBytes);
+    if (external !== null) signatureBytes = external;
+  } catch {
+    signatureBytes = undefined;
   }
 
-  if (!signatureBytes) {
+  if (signatureBytes === undefined) {
+    if (!isKeyPairSigner(session.signer)) {
+      throw new Error("Receipt signing needs the connected wallet or a local session key.");
+    }
     signatureBytes = await signBytes(session.signer.keyPair.privateKey, hashBytes);
   }
 
@@ -840,6 +1272,392 @@ export async function computeSingleReceiptHash(receipt: {
   });
 }
 
+class SettledTransactionFailed extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SettledTransactionFailed";
+  }
+}
+
+function collectAccountKeys(transaction: unknown): string[] {
+  const keys: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value === "string") keys.push(value);
+    else if (typeof value === "object" && value !== null && "pubkey" in value) {
+      const pubkey = (value as { pubkey?: unknown }).pubkey;
+      if (typeof pubkey === "string") keys.push(pubkey);
+    }
+  };
+  if (typeof transaction !== "object" || transaction === null) return keys;
+  const message = (transaction as { transaction?: { message?: Record<string, unknown> } }).transaction?.message;
+  const lists = [message?.accountKeys, message?.staticAccountKeys];
+  for (const list of lists) {
+    if (Array.isArray(list)) for (const key of list) push(key);
+  }
+  const loaded = (transaction as { meta?: { loadedAddresses?: { writable?: unknown[]; readonly?: unknown[] } } }).meta?.loadedAddresses;
+  for (const key of loaded?.writable ?? []) push(key);
+  for (const key of loaded?.readonly ?? []) push(key);
+  return keys;
+}
+
+async function readSettledTransaction(session: Session, signature: string): Promise<{ slot: string }> {
+  let response: {
+    slot?: bigint | number;
+    meta?: { err?: unknown } | null;
+    transaction?: { message?: Record<string, unknown> };
+  } | null;
+  try {
+    response = await session.client.solanaRpc.getTransaction(signature as Signature, {
+      commitment: "confirmed",
+      encoding: "json",
+      maxSupportedTransactionVersion: 0,
+    }).send();
+  } catch (error) {
+    throw new Error(
+      `getTransaction failed for ${signature}. A signature status is not proof of the shielded program. ${errorText(error)}`,
+    );
+  }
+  if (!response?.meta) {
+    throw new Error(`getTransaction returned no meta for ${signature}.`);
+  }
+  if (response.meta.err !== null && response.meta.err !== undefined) {
+    throw new SettledTransactionFailed(`Transaction ${signature} failed on-chain.`);
+  }
+  const accountKeys = collectAccountKeys(response);
+  if (accountKeys.length === 0) {
+    throw new Error(`getTransaction for ${signature} did not include account keys, so it was not treated as failed.`);
+  }
+  if (!accountKeys.includes(SHIELDED_POOL_PROGRAM_ID)) {
+    throw new SettledTransactionFailed(
+      `Transaction ${signature} does not include the shielded-pool program ${SHIELDED_POOL_PROGRAM_ID}.`,
+    );
+  }
+  return { slot: String(response.slot ?? "") };
+}
+
+async function assertShieldedTransaction(session: Session, signature: string): Promise<void> {
+  await readSettledTransaction(session, signature);
+}
+
+function displayAmount(mint: string, amount: bigint, fallbackDecimals: number): string {
+  const decimals = mint === SOL_MINT ? 9 : mint === USDC_MINT ? 6 : fallbackDecimals;
+  return decimals > 0 ? formatAmount(amount, decimals) : amount.toString();
+}
+
+function noteFromPlaintext(
+  session: Session,
+  signature: string,
+  slotIndex: number,
+  plaintext: { assetId: bigint; amount: bigint },
+  role: DecryptedNote["role"],
+  recipientViewingKey: string,
+  fallbackDecimals: number,
+): DecryptedNote {
+  let mint = `asset-id:${plaintext.assetId.toString()}`;
+  try {
+    mint = session.wallet.registry.resolve(plaintext.assetId);
+  } catch {
+    mint = `asset-id:${plaintext.assetId.toString()}`;
+  }
+  return {
+    signature,
+    slotIndex,
+    mint,
+    assetId: plaintext.assetId.toString(),
+    amountBaseUnits: plaintext.amount.toString(),
+    amountDisplay: displayAmount(mint, plaintext.amount, fallbackDecimals),
+    role,
+    recipientViewingKey,
+  };
+}
+
+function confidentialBody(payload: Uint8Array): Uint8Array | undefined {
+  try {
+    const frame = decodeOutputData(payload);
+    if (frame.encoding !== "encrypted") return undefined;
+    if (frame.scheme !== EncryptedScheme.confidential && frame.scheme !== EncryptedScheme.ringConfidential) {
+      return undefined;
+    }
+    if (frame.body.length < 33) return undefined;
+    return frame.body;
+  } catch {
+    return undefined;
+  }
+}
+
+async function decryptIndexedTransaction(
+  session: Session,
+  transaction: IndexedShieldedTransaction,
+  options: VerifyAuditOptions,
+): Promise<DecryptedNote[]> {
+  const firstNullifier = transaction.nullifiers[0];
+  const salt = transaction.salt;
+  const published = transaction.txViewingPublicKey;
+  if (firstNullifier === undefined || salt === undefined || published === undefined) {
+    throw new Error("Indexed transaction is missing the first nullifier, salt, or transaction viewing public key.");
+  }
+  await backfillAssetRegistry(session.wallet, session.client).catch(() => 0);
+  const signature = transaction.txSignature;
+  if (options.mode === "paystub") {
+    if (options.useSessionKey === true) {
+      const viewingPublicKey = session.keys.viewingPublicKeys()[0];
+      if (viewingPublicKey === undefined) throw new Error("This session has no viewing key.");
+      const notes: DecryptedNote[] = [];
+      for (let slotIndex = 0; slotIndex < transaction.outputSlots.length; slotIndex += 1) {
+        const slot = transaction.outputSlots[slotIndex];
+        if (slot === undefined) continue;
+        const body = confidentialBody(slot.payload);
+        if (body === undefined) continue;
+        try {
+          const opened = await session.keys.decrypt([{
+            ciphertext: body.subarray(33),
+            viewingPublicKey,
+            txViewingPublicKey: published,
+            salt,
+            slotIndex,
+            label: "transfer",
+          }]);
+          const plaintext = opened[0];
+          if (plaintext === undefined) continue;
+          notes.push(noteFromPlaintext(
+            session,
+            signature,
+            slotIndex,
+            decodeConfidential(plaintext),
+            "opened-note",
+            hexBytes(viewingPublicKey.toBytes()),
+            0,
+          ));
+        } catch {
+          // A slot encrypted to someone else fails this viewing key.
+        }
+      }
+      return notes;
+    }
+    if (options.viewingKey === undefined) {
+      throw new Error("Paste the recipient's 32-byte viewing key, or use the connected wallet.");
+    }
+    const key = ViewingKey.fromBytes(bytes32(options.viewingKey));
+    try {
+      const notes: DecryptedNote[] = [];
+      transaction.outputSlots.forEach((slot, slotIndex) => {
+        const body = confidentialBody(slot.payload);
+        if (body === undefined) return;
+        try {
+          notes.push(noteFromPlaintext(
+            session,
+            signature,
+            slotIndex,
+            decodeConfidential(key.decryptUtxo(body.subarray(33), published, salt, slotIndex)),
+            "opened-note",
+            hexBytes(key.publicKey().toBytes()),
+            0,
+          ));
+        } catch {
+          // This slot is not encrypted to the pasted recipient key.
+        }
+      });
+      return notes;
+    } finally {
+      key.destroy();
+    }
+  }
+
+  const notes: DecryptedNote[] = [];
+  let txKey: ViewingKey;
+  let senderPublic: X25519PublicKey | undefined;
+  let authored: ViewingKey | undefined;
+  if (options.useSessionKey === true) {
+    const viewingPublicKey = session.keys.viewingPublicKeys()[0];
+    if (viewingPublicKey === undefined) throw new Error("This session has no viewing key.");
+    senderPublic = viewingPublicKey;
+    const derived = await session.keys.transactionKeys([{ viewingPublicKey, firstNullifier }]);
+    const key = derived[0];
+    if (key === undefined) throw new Error("The session did not derive a transaction viewing key.");
+    txKey = key;
+  } else {
+    if (options.viewingKey === undefined) {
+      throw new Error("Paste the employer viewing key, or use the connected wallet.");
+    }
+    const pasted = ViewingKey.fromBytes(bytes32(options.viewingKey));
+    authored = pasted;
+    const derived = pasted.transactionViewingKey(firstNullifier);
+    if (sameBytes(derived.publicKey().toBytes(), published.toBytes())) {
+      senderPublic = pasted.publicKey();
+      txKey = derived;
+    } else if (sameBytes(pasted.publicKey().toBytes(), published.toBytes())) {
+      derived.destroy();
+      txKey = pasted;
+      authored = undefined;
+    } else {
+      derived.destroy();
+      pasted.destroy();
+      throw new Error(
+        "This key is neither the sender viewing key nor the transaction viewing key for the first nullifier.",
+      );
+    }
+  }
+  try {
+    if (!sameBytes(txKey.publicKey().toBytes(), published.toBytes())) {
+      throw new Error(
+        "transactionViewingKey(firstNullifier) does not match the published transaction viewing key, so this wallet did not author the transfer.",
+      );
+    }
+    transaction.outputSlots.forEach((slot, slotIndex) => {
+      const body = confidentialBody(slot.payload);
+      if (body === undefined) return;
+      try {
+        const embedded = X25519PublicKey.fromBytes(body.subarray(0, 33));
+        const plaintext = decodeConfidential(txKey.decryptSlotEphemeral(embedded, body.subarray(33), salt, slotIndex));
+        const senderChange = senderPublic !== undefined && sameBytes(embedded.toBytes(), senderPublic.toBytes());
+        notes.push(noteFromPlaintext(
+          session,
+          signature,
+          slotIndex,
+          plaintext,
+          senderChange ? "sender-change" : "recipient",
+          hexBytes(embedded.toBytes()),
+          0,
+        ));
+      } catch {
+        // Dummy slots do not decrypt under the transaction viewing key.
+      }
+    });
+    return notes;
+  } finally {
+    if (authored !== undefined && authored !== txKey) authored.destroy();
+    txKey.destroy();
+  }
+}
+
+function claimedUnits(value: { amountBaseUnits?: unknown; amount?: unknown; amountSol?: unknown }, decimals: number): bigint | undefined {
+  if (typeof value.amountBaseUnits === "string" && /^\d+$/.test(value.amountBaseUnits)) {
+    return BigInt(value.amountBaseUnits);
+  }
+  const amount = Number(value.amount ?? value.amountSol);
+  if (!Number.isFinite(amount) || amount < 0) return undefined;
+  return parseAmount(amount.toFixed(decimals), decimals);
+}
+
+function subtractAmounts(haystack: readonly bigint[], needles: readonly bigint[]): { missing: bigint[]; leftover: bigint[] } {
+  const left = [...haystack];
+  const missing: bigint[] = [];
+  for (const needle of needles) {
+    const index = left.findIndex((value) => value === needle);
+    if (index < 0) missing.push(needle);
+    else left.splice(index, 1);
+  }
+  return { missing, leftover: left };
+}
+
+function compareDecryptedAmounts(
+  mode: VerifyAuditMode,
+  notes: readonly DecryptedNote[],
+  chunks: readonly any[],
+  decimals: number,
+): { integrity: "VERIFIED" | "TAMPERED"; reason: string } {
+  const payouts: bigint[] = [];
+  const fees: bigint[] = [];
+  for (const chunk of chunks) {
+    const rows = Array.isArray(chunk?.payouts) ? chunk.payouts : [];
+    for (const payout of rows) {
+      const units = claimedUnits(payout, decimals);
+      if (units !== undefined) payouts.push(units);
+    }
+    if (chunk?.protocolFee) {
+      const units = claimedUnits(chunk.protocolFee, decimals);
+      if (units !== undefined && units > 0n) fees.push(units);
+    }
+  }
+  if (payouts.length === 0 && fees.length === 0) return { integrity: "VERIFIED", reason: "" };
+  if (mode === "paystub") {
+    const opened = notes.map((note) => BigInt(note.amountBaseUnits));
+    const check = subtractAmounts(payouts, opened);
+    if (check.missing.length > 0) {
+      return {
+        integrity: "TAMPERED",
+        reason: "An amount opened by this recipient viewing key is not in the pasted receipt.",
+      };
+    }
+    return { integrity: "VERIFIED", reason: "" };
+  }
+  const recipientAmounts = notes
+    .filter((note) => note.role === "recipient" || note.role === "opened-note")
+    .map((note) => BigInt(note.amountBaseUnits));
+  const senderAmounts = notes
+    .filter((note) => note.role === "sender-change")
+    .map((note) => BigInt(note.amountBaseUnits));
+  const payoutsOnly = subtractAmounts(recipientAmounts, payouts);
+  const payoutsPlusFees = subtractAmounts(recipientAmounts, [...payouts, ...fees]);
+  const senderHoldsFees = subtractAmounts(senderAmounts, fees).missing.length === 0;
+  const recipientExact = payoutsOnly.missing.length === 0 && payoutsOnly.leftover.length === 0 && senderHoldsFees;
+  const feeIsRecipient = payoutsPlusFees.missing.length === 0 && payoutsPlusFees.leftover.length === 0;
+  if (recipientExact || feeIsRecipient) return { integrity: "VERIFIED", reason: "" };
+  const allAmounts = notes.map((note) => BigInt(note.amountBaseUnits));
+  const claimed = subtractAmounts(allAmounts, [...payouts, ...fees]);
+  if (claimed.missing.length > 0) {
+    return {
+      integrity: "TAMPERED",
+      reason: "The receipt lists an amount that is not in the on-chain decrypted outputs.",
+    };
+  }
+  return { integrity: "VERIFIED", reason: "" };
+}
+
+/** 32-byte viewing-key secret. Rejects a 64-byte ed25519 derivation signature. */
+export function parseViewingKeyBytes(text: string): Uint8Array {
+  const trimmed = text.trim();
+  if (/^[0-9a-fA-F]{128}$/.test(trimmed)) {
+    throw new Error("That value is 64 bytes. A viewing key is 32 bytes, not the ed25519 derivation signature.");
+  }
+  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    const bytes = new Uint8Array(32);
+    for (let index = 0; index < 32; index += 1) {
+      bytes[index] = Number.parseInt(trimmed.slice(index * 2, index * 2 + 2), 16);
+    }
+    return bytes;
+  }
+  const decoded = new Uint8Array(getBase58Encoder().encode(trimmed));
+  if (decoded.length === 64) {
+    throw new Error("That value is 64 bytes. A viewing key is 32 bytes, not the ed25519 derivation signature.");
+  }
+  if (decoded.length !== 32) {
+    throw new Error(`A viewing key is 32 bytes. This value is ${decoded.length} bytes.`);
+  }
+  return decoded;
+}
+
+/**
+ * Hex secret of `transactionViewingKey(firstNullifier)` for one authored transaction.
+ * Holding it opens every output of that transaction, including change and every recipient.
+ */
+export async function exportBatchTransactionViewingKey(session: Session, signatureText: string): Promise<string> {
+  const indexed = await session.client.getShieldedTransactionsBySignature(signatureText as Signature);
+  const viewingPublicKey = session.keys.viewingPublicKeys()[0];
+  if (viewingPublicKey === undefined) throw new Error("This session has no viewing key.");
+  for (const event of indexed.transactions) {
+    const transaction = event.transaction;
+    const firstNullifier = transaction.nullifiers[0];
+    const published = transaction.txViewingPublicKey;
+    if (firstNullifier === undefined || published === undefined) continue;
+    const derived = await session.keys.transactionKeys([{ viewingPublicKey, firstNullifier }]);
+    const txKey = derived[0];
+    if (txKey === undefined) continue;
+    try {
+      if (!sameBytes(txKey.publicKey().toBytes(), published.toBytes())) continue;
+      const secret = txKey.secretBytes();
+      try {
+        return hexBytes(secret);
+      } finally {
+        secret.fill(0);
+      }
+    } finally {
+      txKey.destroy();
+    }
+  }
+  throw new Error("This wallet did not author a shielded event in that signature, so there is no batch transaction viewing key to export.");
+}
+
 /**
  * Strictly verifies a selective audit receipt against on-chain Solana state and Ed25519 payer attestation:
  *  1. Requires a non-empty `slot` and verifies `confirmedSlot === receiptSlot` for EVERY chunk on-chain
@@ -850,16 +1668,21 @@ export async function computeSingleReceiptHash(receipt: {
  */
 export async function verifyAuditReceipt(
   session: Session,
-  receiptJson: string
+  receiptJson: string,
+  options: VerifyAuditOptions,
 ): Promise<VerificationResult> {
   let parsed: any;
+  const trimmedReceipt = receiptJson.trim();
   try {
-    parsed = typeof receiptJson === "string" ? JSON.parse(receiptJson) : receiptJson;
+    parsed = JSON.parse(trimmedReceipt);
   } catch {
-    throw new Error("Invalid JSON audit receipt format");
+    if (!/^[1-9A-HJ-NP-Za-km-z]{64,100}$/.test(trimmedReceipt)) {
+      throw new Error("Paste a transaction signature or a receipt JSON object.");
+    }
+    parsed = { txSignature: trimmedReceipt };
   }
 
-  const ringProgramId = "ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW";
+  const ringProgramId = SHIELDED_POOL_PROGRAM_ID;
   const { client } = session;
 
   // Normalize chunks array
@@ -897,11 +1720,6 @@ export async function verifyAuditReceipt(
     }
 
     const receiptSlot = (chunk.slot || parsed.slot || "").toString().trim();
-    if (!receiptSlot) {
-      throw new Error(
-        `Receipt chunk ${idx + 1} (${txSig.slice(0, 8)}…) is missing a block slot (slot). Strict on-chain verification requires a valid block slot.`
-      );
-    }
 
     let confirmedSlot = "";
     let txSuccess = false;
@@ -910,15 +1728,21 @@ export async function verifyAuditReceipt(
 
     try {
       const txResponse = await client.solanaRpc
-        .getTransaction(txSig, {
+        .getTransaction(txSig as Signature, {
           commitment: "confirmed",
           encoding: "json",
-          maxSupportedTransactionVersion: 1,
-        } as any)
+          maxSupportedTransactionVersion: 0,
+        })
         .send();
 
+      if (!txResponse) {
+        throw new Error(`getTransaction returned no transaction for ${txSig}.`);
+      }
       if (txResponse) {
-        txSuccess = txResponse.meta?.err === null || txResponse.meta?.err === undefined;
+        if (!txResponse.meta) {
+          throw new Error(`getTransaction for ${txSig} did not include meta.`);
+        }
+        txSuccess = txResponse.meta.err === null;
         confirmedSlot = txResponse.slot?.toString() ?? "";
 
         const accountKeys: string[] = [];
@@ -942,23 +1766,17 @@ export async function verifyAuditReceipt(
         chunkSigner = accountKeys[0] || "";
         programFound = accountKeys.some((k) => k === ringProgramId);
       }
-    } catch {
-      // Fallback to getSignatureStatuses if RPC version/rate limit encountered
-      const signatureStatus = await client.solanaRpc.getSignatureStatuses([txSig]).send();
-      const status = signatureStatus.value[0];
-      if (!status || status.err !== null) {
-        throw new Error(`Transaction ${txSig} was not found or failed on ${networkLabel}`);
-      }
-      txSuccess = status.err === null;
-      confirmedSlot = status.slot?.toString() ?? "";
-      programFound = true; // signature confirmed on-chain
+    } catch (error) {
+      throw new Error(
+        `getTransaction failed for ${txSig}. A signature status is not proof of the shielded program. ${errorText(error)}`,
+      );
     }
 
     if (!txSuccess) {
       throw new Error(`Transaction ${txSig} for chunk ${idx + 1} failed on-chain (meta.err ≠ null).`);
     }
 
-    if (confirmedSlot !== receiptSlot) {
+    if (receiptSlot && confirmedSlot !== receiptSlot) {
       throw new Error(
         `On-chain slot mismatch for chunk ${idx + 1}: receipt claimed slot #${receiptSlot} but transaction landed in slot #${confirmedSlot}.`
       );
@@ -1005,93 +1823,115 @@ export async function verifyAuditReceipt(
     );
   }
 
-  // 3. Cryptographic Ed25519 signature verification
   const payerSignature: string | undefined = parsed.payerSignature;
-  if (!payerSignature) {
-    throw new Error(
-      "Audit receipt is missing payerSignature. Ed25519 digital signature attestation from the payer is required for institutional verification."
-    );
-  }
-
   const hashToVerify: string | undefined = parsed.receiptCommitmentHash;
-  if (!hashToVerify) {
-    throw new Error("Audit receipt is missing receiptCommitmentHash.");
+  let payerSignatureVerified = false;
+  let commitmentVerified = false;
+  if (payerSignature || hashToVerify) {
+    if (!payerSignature || !hashToVerify) {
+      throw new Error("A receipt that carries a payer signature or a commitment hash must carry both.");
+    }
+    let sigBytes: Uint8Array;
+    if (/^[0-9a-fA-F]{128}$/.test(payerSignature.trim())) {
+      const pairs = payerSignature.trim().match(/../g);
+      if (!pairs) throw new Error("Payer signature hex could not be read.");
+      sigBytes = Uint8Array.from(pairs, (byte) => parseInt(byte, 16));
+    } else {
+      sigBytes = new Uint8Array(getBase58Encoder().encode(payerSignature.trim()));
+    }
+    const pubBytes = new Uint8Array(getBase58Encoder().encode(claimedPayerPubkey.trim()));
+    const msgBytes = new TextEncoder().encode(hashToVerify.trim());
+    try {
+      payerSignatureVerified = ed25519.verify(sigBytes, msgBytes, pubBytes);
+    } catch (err: unknown) {
+      throw new Error(`Ed25519 signature check error: ${errorText(err)}`);
+    }
+    if (!payerSignatureVerified) {
+      throw new Error(
+        `Cryptographic signature verification failed: payerSignature is NOT a valid Ed25519 signature from payer ${claimedPayerPubkey} over the receipt commitment hash.`,
+      );
+    }
+    const canonicalChunks: CanonicalChunkPayload[] = rawChunks.map((chunk: any, index: number) => ({
+      chunkIndex: chunk.chunkIndex ?? index,
+      txSignature: chunk.txSignature,
+      slot: (chunk.slot || parsed.slot || "").toString(),
+      payouts: Array.isArray(chunk.payouts) ? chunk.payouts : parsed.payout ? [parsed.payout] : [],
+      protocolFee: chunk.protocolFee || null,
+    }));
+    const recomputedHash = await computeReceiptCommitmentHash({
+      network: parsed.network || networkLabel,
+      programId: ringProgramId,
+      payerPubkey: claimedPayerPubkey,
+      asset,
+      mint,
+      chunks: canonicalChunks,
+    });
+    if (recomputedHash !== hashToVerify) {
+      throw new Error(
+        "Receipt integrity check failed: SHA-256 commitment hash does not match recomputed digest. " +
+        "Disclosed amounts, recipient addresses, transaction slots, or fees have been tampered with.",
+      );
+    }
+    commitmentVerified = true;
   }
 
-  let sigBytes: Uint8Array;
-  if (/^[0-9a-fA-F]{128}$/.test(payerSignature.trim())) {
-    sigBytes = Uint8Array.from(payerSignature.trim().match(/../g)!, (b) => parseInt(b, 16));
-  } else {
-    sigBytes = new Uint8Array(getBase58Encoder().encode(payerSignature.trim()));
+  const decryptedOutputs: DecryptedNote[] = [];
+  for (const chunk of rawChunks) {
+    const indexed = await client.getShieldedTransactionsBySignature(chunk.txSignature as Signature);
+    if (indexed.transactions.length === 0) {
+      throw new Error(`The shielded indexer has no event for ${chunk.txSignature}.`);
+    }
+    for (const event of indexed.transactions) {
+      decryptedOutputs.push(...await decryptIndexedTransaction(session, event.transaction, options));
+    }
   }
-
-  const pubBytes = new Uint8Array(getBase58Encoder().encode(claimedPayerPubkey.trim()));
-  const msgBytes = new TextEncoder().encode(hashToVerify.trim());
-
-  let isSigValid = false;
-  try {
-    isSigValid = ed25519.verify(sigBytes, msgBytes, pubBytes);
-  } catch (err: any) {
-    throw new Error(`Ed25519 signature check error: ${err?.message || String(err)}`);
-  }
-
-  if (!isSigValid) {
+  if (decryptedOutputs.length === 0) {
     throw new Error(
-      `Cryptographic signature verification failed: payerSignature is NOT a valid Ed25519 signature from payer ${claimedPayerPubkey} over the receipt commitment hash.`
+      options.mode === "paystub"
+        ? "This viewing key opened no output. decryptUtxo only opens a note encrypted to that key."
+        : "The transaction viewing key opened no confidential output.",
     );
   }
 
-  // 4. Recompute SHA-256 commitment digest over canonical chunks and verify tamper evidence
-  const canonicalChunks: CanonicalChunkPayload[] = rawChunks.map((c: any, i: number) => ({
-    chunkIndex: c.chunkIndex ?? i,
-    txSignature: c.txSignature,
-    slot: (c.slot || parsed.slot || "").toString(),
-    payouts: Array.isArray(c.payouts) ? c.payouts : parsed.payout ? [parsed.payout] : [],
-    protocolFee: c.protocolFee || null,
+  const audit = compareDecryptedAmounts(options.mode, decryptedOutputs, rawChunks, decimals);
+  const chainPayouts: PayrollPayoutRecord[] = decryptedOutputs.map((note) => ({
+    recipient: note.role === "sender-change"
+      ? `sender change ${note.recipientViewingKey}`
+      : note.recipientViewingKey,
+    amountBaseUnits: note.amountBaseUnits,
+    amountLamports: note.amountBaseUnits,
+    memo: `${note.role} · slot ${note.slotIndex} · ${note.mint}`,
   }));
-
-  const recomputedHash = await computeReceiptCommitmentHash({
-    network: parsed.network || networkLabel,
-    programId: ringProgramId,
-    payerPubkey: claimedPayerPubkey,
-    asset,
-    mint,
-    chunks: canonicalChunks,
-  });
-
-  if (recomputedHash !== hashToVerify) {
-    throw new Error(
-      "Receipt integrity check failed: SHA-256 commitment hash does not match recomputed digest. " +
-      "Disclosed amounts, recipient addresses, transaction slots, or fees have been tampered with."
-    );
-  }
-
-  const totalDisclosed = totalConfirmedPayouts.reduce((sum, p) => sum + (Number(p.amount ?? p.amountSol) || 0), 0);
+  const totalBase = decryptedOutputs.reduce((sum, note) => sum + BigInt(note.amountBaseUnits), 0n);
 
   return {
-    valid: true,
+    valid: audit.integrity === "VERIFIED",
+    mode: options.mode,
+    integrity: audit.integrity,
+    ...(audit.reason ? { tamperReason: audit.reason } : {}),
+    decryptedOutputs,
     txSignature: rawChunks[0]?.txSignature || parsed.txSignature,
     slot: firstConfirmedSlot || rawChunks[0]?.slot || parsed.slot || "",
     network: parsed.network || networkLabel,
     asset,
-    mint,
+    mint: decryptedOutputs[0]?.mint || mint,
     decimals,
-    disclosedPayouts: totalConfirmedPayouts,
+    disclosedPayouts: chainPayouts,
     protocolFee: rawChunks[0]?.protocolFee,
-    totalDisclosed,
-    totalDisclosedSol: totalDisclosed,
-    onChainEventCount: 1,
-    outputSlotCount: rawChunks.length > 0 ? (rawChunks[0]?.payouts?.length ?? 1) + 1 : 2,
+    totalDisclosed: Number(totalBase) / 10 ** decimals,
+    totalDisclosedSol: Number(totalBase) / 10 ** decimals,
+    onChainEventCount: decryptedOutputs.length,
+    outputSlotCount: decryptedOutputs.length,
     ringProgramId,
     timestamp: parsed.formattedDate || new Date().toISOString(),
-    receiptCommitmentHash: hashToVerify,
-    commitmentVerified: true,
+    ...(hashToVerify ? { receiptCommitmentHash: hashToVerify } : {}),
+    commitmentVerified,
     onChainSlotMatch: true,
     programInvocationConfirmed: true,
     txSuccessConfirmed: true,
     payerPubkey: claimedPayerPubkey,
-    payerSignature,
-    payerSignatureVerified: true,
+    ...(payerSignature ? { payerSignature } : {}),
+    payerSignatureVerified,
     chunksVerifiedCount: rawChunks.length,
   };
 }

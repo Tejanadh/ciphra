@@ -1,8 +1,21 @@
-// A demo signer kept in browser storage, standing in for a wallet extension.
-// Each network and protocol release has its own testing key.
+/// <reference lib="dom" />
+/// <reference types="vite/client" />
+// Session secrets stay in this module's memory. Nothing here writes a private
+// key, seed, or shielded key into localStorage or sessionStorage.
+import { ED25519_SEED_LEN, ed25519DerivationMessage, type Bytes32 } from "@heliuslabs/spr/keypair";
+import {
+  address,
+  getAddressEncoder,
+  isSignatureBytes,
+  type Address,
+  type SignatureBytes,
+  type SignatureDictionary,
+  type TransactionPartialSigner,
+} from "@solana/kit";
+
+/** Legacy storage name. Still exported so startup can delete leftover copies. */
 export const burnerStorageKey = (network: string) => `zolana-example-burner-v0.6.0-${network}`;
 
-// Public address of pre-funded Devnet payer (CochBy...HQ1)
 export const FUNDED_PAYER_ADDRESS = "CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1";
 
 export type WalletType = "demo" | "phantom" | "solflare" | "burner";
@@ -14,28 +27,115 @@ export interface ConnectedWalletInfo {
   name: string;
 }
 
+/** Shielded keys for a connected wallet: the 64-byte signature over `ed25519DerivationMessage`. */
+export interface WalletSessionUnlock {
+  readonly kind: "wallet-signature";
+  readonly solanaPublicKey: Address;
+  readonly derivationSeed: Uint8Array;
+  readonly signer: TransactionPartialSigner;
+}
+
+interface BrowserWalletProvider {
+  connect: () => Promise<{ publicKey?: { toString(): string } } | undefined>;
+  publicKey?: { toString(): string };
+  signMessage?: (message: Uint8Array, display?: string) => Promise<{ signature?: Uint8Array } | Uint8Array>;
+  disconnect?: () => Promise<void> | void;
+  isPhantom?: boolean;
+  isSolflare?: boolean;
+}
+
+interface LocalMaterial {
+  seed: Uint8Array;
+  origin: "funded" | "burner" | "e2e";
+}
+
+interface ConnectedWallet {
+  type: "phantom" | "solflare";
+  address: string;
+  network: string;
+  solanaPublicKey: Address;
+  derivationSeed: Uint8Array;
+  signer: TransactionPartialSigner;
+  provider: BrowserWalletProvider;
+}
+
+const localKeys = new Map<string, LocalMaterial>();
+let connected: ConnectedWallet | null = null;
+
+const PERSISTED_SECRET_KEYS = [
+  "zolana-example-burner",
+  burnerStorageKey("devnet"),
+  burnerStorageKey("mainnet"),
+  "ciphra_wallet_seed",
+  "ciphra_use_funded",
+  "veilpay_use_funded",
+  "ciphra_wallet_type",
+  "ciphra_wallet_address",
+];
+
+function wipe(bytes: Uint8Array | undefined): void {
+  bytes?.fill(0);
+}
+
+/** Deletes leftover plaintext secrets from earlier builds. Public payroll receipts are left alone. */
+export function purgePersistedSecrets(): void {
+  if (typeof localStorage === "undefined") return;
+  for (const key of PERSISTED_SECRET_KEYS) localStorage.removeItem(key);
+  if (typeof localStorage.key !== "function" || typeof localStorage.length !== "number") return;
+  const found: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key !== null) found.push(key);
+  }
+  for (const key of found) {
+    if (
+      key.startsWith("ciphra_wallet_seed_") ||
+      key.startsWith("zolana-example-burner") ||
+      key.startsWith("veilpay_wallet_seed_")
+    ) {
+      localStorage.removeItem(key);
+    }
+  }
+}
+
+function viteEnv(): ImportMetaEnv | undefined {
+  return import.meta.env;
+}
+
 /**
- * Reads the pre-funded keypair bytes strictly from environment variable `VITE_FUNDED_KEYPAIR`.
- * Returns null if not provided, ensuring zero hardcoded secrets exist in the codebase.
+ * Reads the pre-funded keypair bytes strictly from `VITE_FUNDED_KEYPAIR`.
+ * Returns null when the variable is absent. The bytes are not written to browser storage.
  */
 export function getFundedKeypairBytes(): Uint8Array | null {
-  const envVal: string | undefined = import.meta.env.VITE_FUNDED_KEYPAIR;
-  if (envVal) {
-    const trimmed = envVal.trim();
-    try {
-      if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-        const parsed = JSON.parse(trimmed);
-        if (Array.isArray(parsed) && (parsed.length === 32 || parsed.length === 64)) {
-          return new Uint8Array(parsed.slice(0, 32));
+  const envVal = viteEnv()?.VITE_FUNDED_KEYPAIR;
+  if (envVal === undefined || envVal === "") return null;
+  const trimmed = envVal.trim();
+  try {
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (Array.isArray(parsed) && (parsed.length === 32 || parsed.length === 64)) {
+        const bytes: number[] = [];
+        for (const entry of parsed.slice(0, 32)) {
+          if (typeof entry !== "number") return null;
+          bytes.push(entry);
         }
+        return new Uint8Array(bytes);
       }
-      if (/^[0-9a-fA-F]{64,128}$/.test(trimmed)) {
-        const hex = trimmed.slice(0, 64);
-        return Uint8Array.from(hex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
-      }
-    } catch {
-      // Ignore parse error and return null
     }
+    if (/^[0-9a-fA-F]{64,128}$/.test(trimmed)) {
+      const hex = trimmed.slice(0, 64);
+      const pairs = hex.match(/../g);
+      if (pairs === null) return null;
+      const out = new Uint8Array(pairs.length);
+      for (let i = 0; i < pairs.length; i++) {
+        const pair = pairs[i];
+        if (pair === undefined) return null;
+        out[i] = Number.parseInt(pair, 16);
+      }
+      return out;
+    }
+  } catch {
+    return null;
   }
   return null;
 }
@@ -44,158 +144,203 @@ export function hasFundedDevnetPayer(): boolean {
   return getFundedKeypairBytes() !== null;
 }
 
-export function getActiveWalletInfo(currentSignerAddress?: string): ConnectedWalletInfo {
-  const hasFunded = hasFundedDevnetPayer();
-  const storedType = localStorage.getItem("ciphra_wallet_type") as WalletType | null;
-  const type: WalletType = storedType || (hasFunded ? "demo" : "burner");
-  const address = localStorage.getItem("ciphra_wallet_address") || currentSignerAddress || (hasFunded ? FUNDED_PAYER_ADDRESS : "");
-  const isExternal = type === "phantom" || type === "solflare";
-  const name = type === "phantom" ? "Phantom" : type === "solflare" ? "Solflare" : type === "demo" ? "Demo Payer" : "Burner";
-  return { type, address, isExternal, name };
+function consumeDevSeed(): Uint8Array | null {
+  if (viteEnv()?.DEV !== true) return null;
+  const host = globalThis as { __ciphraE2ESeed?: unknown };
+  const hex = host.__ciphraE2ESeed;
+  if (typeof hex !== "string" || !/^[0-9a-f]{64}$/i.test(hex)) return null;
+  delete host.__ciphraE2ESeed;
+  return Uint8Array.from(hex.match(/../g) ?? [], (byte) => Number.parseInt(byte, 16));
 }
 
-export async function connectBrowserWallet(type: "phantom" | "solflare"): Promise<{ address: string; seed: Uint8Array }> {
-  let provider: any = null;
-  const win = window as any;
+export function getActiveWalletInfo(currentSignerAddress?: string): ConnectedWalletInfo {
+  if (connected !== null) {
+    const name = connected.type === "phantom" ? "Phantom" : "Solflare";
+    return { type: connected.type, address: connected.address, isExternal: true, name };
+  }
+  const funded = hasFundedDevnetPayer();
+  const addressText = currentSignerAddress || (funded ? FUNDED_PAYER_ADDRESS : "");
+  return {
+    type: funded ? "demo" : "burner",
+    address: addressText,
+    isExternal: false,
+    name: funded ? "Demo Payer" : "Burner",
+  };
+}
 
+function walletProvider(type: "phantom" | "solflare"): BrowserWalletProvider {
+  const win = window as {
+    phantom?: { solana?: BrowserWalletProvider };
+    solana?: BrowserWalletProvider;
+    solflare?: BrowserWalletProvider;
+  };
   if (type === "phantom") {
-    provider = win.phantom?.solana || win.solana;
-    if (!provider || !provider.isPhantom) {
+    const provider = win.phantom?.solana || win.solana;
+    if (!provider?.isPhantom) {
       throw new Error("Phantom wallet extension not detected. Please install Phantom from https://phantom.app");
     }
-  } else if (type === "solflare") {
-    provider = win.solflare;
-    if (!provider || !provider.isSolflare) {
-      throw new Error("Solflare wallet extension not detected. Please install Solflare from https://solflare.com");
-    }
+    return provider;
   }
+  const provider = win.solflare;
+  if (!provider?.isSolflare) {
+    throw new Error("Solflare wallet extension not detected. Please install Solflare from https://solflare.com");
+  }
+  return provider;
+}
 
+async function signWithProvider(provider: BrowserWalletProvider, message: Uint8Array): Promise<SignatureBytes> {
+  if (typeof provider.signMessage !== "function") {
+    throw new Error("Connected wallet does not support signMessage for shielded key derivation.");
+  }
+  const sigRes = await provider.signMessage(message, "utf8");
+  const signature = sigRes instanceof Uint8Array ? sigRes : sigRes.signature;
+  const candidate = signature ?? new Uint8Array();
+  if (!isSignatureBytes(candidate)) {
+    throw new Error(
+      `Wallet signature must be ${String(ED25519_SEED_LEN)} bytes (ED25519_SEED_LEN) to derive shielded keys.`,
+    );
+  }
+  return candidate;
+}
+
+function partialSigner(solanaPublicKey: Address, provider: BrowserWalletProvider): TransactionPartialSigner {
+  return {
+    address: solanaPublicKey,
+    async signTransactions(transactions): Promise<readonly SignatureDictionary[]> {
+      const signed: SignatureDictionary[] = [];
+      for (const tx of transactions) {
+        const signature = await signWithProvider(provider, new Uint8Array(tx.messageBytes));
+        signed.push({ [solanaPublicKey]: signature });
+      }
+      return signed;
+    },
+  };
+}
+
+/**
+ * Connects Phantom or Solflare and keeps the shielded derivation seed in memory.
+ * The seed is the wallet signature over `ed25519DerivationMessage(publicKey)`,
+ * which `LocalKeys.fromDerivationSeed` verifies. It is not a Solana private key.
+ */
+export async function connectBrowserWallet(
+  type: "phantom" | "solflare",
+  network: string,
+): Promise<{ address: string; unlock: WalletSessionUnlock }> {
+  purgePersistedSecrets();
+  const provider = walletProvider(type);
   const response = await provider.connect();
-  const pubkeyStr: string = (response?.publicKey || provider.publicKey)?.toString();
-  if (!pubkeyStr) {
+  const pubkeyStr = (response?.publicKey || provider.publicKey)?.toString();
+  if (pubkeyStr === undefined || pubkeyStr === "") {
     throw new Error("Failed to retrieve public key from wallet.");
   }
+  const solanaPublicKey = address(pubkeyStr);
+  const publicKey = new Uint8Array(getAddressEncoder().encode(solanaPublicKey)) as Bytes32;
+  const derivationSeed = await signWithProvider(provider, ed25519DerivationMessage(publicKey));
+  if (connected !== null) wipe(connected.derivationSeed);
+  const signer = partialSigner(solanaPublicKey, provider);
+  connected = { type, address: pubkeyStr, network, solanaPublicKey, derivationSeed, signer, provider };
+  return {
+    address: pubkeyStr,
+    unlock: { kind: "wallet-signature", solanaPublicKey, derivationSeed, signer },
+  };
+}
 
-  // Check for cached deterministic session seed
-  const cacheKey = `ciphra_wallet_seed_${pubkeyStr}`;
-  const cachedHex = localStorage.getItem(cacheKey);
-  if (cachedHex && /^[0-9a-f]{64}$/i.test(cachedHex)) {
-    const seed = Uint8Array.from(cachedHex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
-    localStorage.setItem("ciphra_wallet_type", type);
-    localStorage.setItem("ciphra_wallet_address", pubkeyStr);
-    const netKey = burnerStorageKey("devnet");
-    localStorage.setItem(netKey, cachedHex);
-    localStorage.removeItem("ciphra_use_funded");
-    return { address: pubkeyStr, seed };
-  }
-
-  // Prompt the user to sign an off-chain auth message to derive their zero-knowledge session seed
-  const authMessage = `Ciphra Confidential Payroll Authentication\n\nSign this message to initialize zero-knowledge proving on Solana Privacy Rings.\n\nWallet: ${pubkeyStr}`;
-  const encoded = new TextEncoder().encode(authMessage);
-  let signature: Uint8Array;
-
-  if (typeof provider.signMessage === "function") {
-    const sigRes = await provider.signMessage(encoded, "utf8");
-    signature = sigRes?.signature || sigRes;
-  } else {
-    throw new Error("Connected wallet does not support signMessage for zero-knowledge key derivation.");
-  }
-
-  if (!signature || signature.length < 32) {
-    throw new Error("Invalid signature received from wallet.");
-  }
-
-  // Derive 32-byte Ed25519 session seed from the first 32 bytes of the signature
-  const seed = signature.slice(0, 32);
-  const seedHex = Array.from(seed, (byte) => byte.toString(16).padStart(2, "0")).join("");
-
-  localStorage.setItem(cacheKey, seedHex);
-  localStorage.setItem("ciphra_wallet_type", type);
-  localStorage.setItem("ciphra_wallet_address", pubkeyStr);
-
-  const netKey = burnerStorageKey("devnet");
-  localStorage.setItem(netKey, seedHex);
-  localStorage.removeItem("ciphra_use_funded");
-
-  return { address: pubkeyStr, seed };
+/** Signs with the connected wallet when one is in memory. Returns null otherwise. */
+export async function signConnectedWalletMessage(message: Uint8Array): Promise<Uint8Array | null> {
+  if (connected === null) return null;
+  return signWithProvider(connected.provider, message);
 }
 
 export function disconnectBrowserWallet(network: string = "devnet"): void {
-  const win = window as any;
+  const win = window as {
+    phantom?: { solana?: BrowserWalletProvider };
+    solana?: BrowserWalletProvider;
+    solflare?: BrowserWalletProvider;
+  };
   try {
     if (win.phantom?.solana?.disconnect) void win.phantom.solana.disconnect();
     else if (win.solana?.disconnect) void win.solana.disconnect();
     if (win.solflare?.disconnect) void win.solflare.disconnect();
   } catch {
-    // Ignore disconnect error
+    // Ignore a wallet that is already gone.
   }
-  localStorage.removeItem("ciphra_wallet_type");
-  localStorage.removeItem("ciphra_wallet_address");
-  loadFundedDevnetSeed(network);
+  if (connected !== null) wipe(connected.derivationSeed);
+  connected = null;
+  wipe(localKeys.get(network)?.seed);
+  localKeys.delete(network);
+  purgePersistedSecrets();
 }
 
 export function loadBurnerSeed(network: string): Uint8Array {
-  const key = burnerStorageKey(network);
-  const fundedSeed = getFundedKeypairBytes();
-  const fundedHex = fundedSeed
-    ? Array.from(fundedSeed, (byte) => byte.toString(16).padStart(2, "0")).join("")
-    : null;
+  purgePersistedSecrets();
+  const injected = consumeDevSeed();
+  if (injected !== null) {
+    const previous = localKeys.get(network);
+    if (previous !== undefined) wipe(previous.seed);
+    localKeys.set(network, { seed: injected, origin: "e2e" });
+    return injected;
+  }
+  const existing = localKeys.get(network);
+  if (existing !== undefined) return existing.seed;
 
-  // Check if an external browser wallet is active
-  const walletType = localStorage.getItem("ciphra_wallet_type");
-  const externalAddress = localStorage.getItem("ciphra_wallet_address");
-  if ((walletType === "phantom" || walletType === "solflare") && externalAddress) {
-    const cachedHex = localStorage.getItem(`ciphra_wallet_seed_${externalAddress}`);
-    if (cachedHex && /^[0-9a-f]{64}$/i.test(cachedHex)) {
-      return Uint8Array.from(cachedHex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
+  if (network === "devnet") {
+    const funded = getFundedKeypairBytes();
+    if (funded !== null) {
+      localKeys.set(network, { seed: funded, origin: "funded" });
+      return funded;
     }
   }
 
-  if (network === "devnet" && fundedSeed && fundedHex) {
-    // If explicitly requested, use funded payer
-    if (localStorage.getItem("ciphra_use_funded") === "true" || localStorage.getItem("veilpay_use_funded") === "true") {
-      localStorage.setItem(key, fundedHex);
-      return fundedSeed;
-    }
-  }
-
-  const stored = localStorage.getItem(key);
-  if (stored !== null && /^[0-9a-f]{64}$/u.test(stored)) {
-    return Uint8Array.from(stored.match(/../gu) ?? [], (byte) => Number.parseInt(byte, 16));
-  }
-
-  // Default to pre-funded payer if configured in .env
-  if (network === "devnet" && fundedSeed && fundedHex) {
-    localStorage.setItem(key, fundedHex);
-    localStorage.setItem("ciphra_use_funded", "true");
-    return fundedSeed;
-  }
-
-  // Otherwise generate a fresh ephemeral seed in browser storage
   const seed = crypto.getRandomValues(new Uint8Array(32));
-  localStorage.setItem(key, Array.from(seed, (byte) => byte.toString(16).padStart(2, "0")).join(""));
+  localKeys.set(network, { seed, origin: "burner" });
   return seed;
 }
 
 export function loadFundedDevnetSeed(network: string): Uint8Array {
-  const key = burnerStorageKey(network);
+  purgePersistedSecrets();
+  if (connected !== null) {
+    wipe(connected.derivationSeed);
+    connected = null;
+  }
   const seed = getFundedKeypairBytes();
-  if (seed) {
-    const hex = Array.from(seed, (byte) => byte.toString(16).padStart(2, "0")).join("");
-    localStorage.setItem(key, hex);
-    localStorage.setItem("ciphra_use_funded", "true");
-    localStorage.setItem("ciphra_wallet_type", "demo");
-    localStorage.setItem("ciphra_wallet_address", FUNDED_PAYER_ADDRESS);
+  if (seed !== null) {
+    const previous = localKeys.get(network);
+    if (previous !== undefined) wipe(previous.seed);
+    localKeys.set(network, { seed, origin: "funded" });
     return seed;
   }
-  // Gracefully fallback to ephemeral burner if no funded key is configured in .env
+  return loadBurnerSeed(network);
+}
+
+/** What `openSession` should unlock with: a wallet derivation signature, or a 32-byte local key. */
+export function sessionUnlock(network: string): Uint8Array | WalletSessionUnlock {
+  if (connected !== null && connected.network === network) {
+    return {
+      kind: "wallet-signature",
+      solanaPublicKey: connected.solanaPublicKey,
+      derivationSeed: connected.derivationSeed,
+      signer: connected.signer,
+    };
+  }
   return loadBurnerSeed(network);
 }
 
 export function resetBurner(network: string): void {
-  localStorage.removeItem(burnerStorageKey(network));
-  localStorage.removeItem("ciphra_use_funded");
-  localStorage.removeItem("veilpay_use_funded");
-  localStorage.removeItem("ciphra_wallet_type");
-  localStorage.removeItem("ciphra_wallet_address");
+  if (connected !== null) wipe(connected.derivationSeed);
+  connected = null;
+  const existing = localKeys.get(network);
+  if (existing !== undefined) wipe(existing.seed);
+  localKeys.delete(network);
+  purgePersistedSecrets();
+}
+
+function wipeAllSecrets(): void {
+  if (connected !== null) wipe(connected.derivationSeed);
+  connected = null;
+  for (const entry of localKeys.values()) wipe(entry.seed);
+  localKeys.clear();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", wipeAllSecrets);
 }

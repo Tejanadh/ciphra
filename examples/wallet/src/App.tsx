@@ -8,9 +8,9 @@ import {
   disconnectBrowserWallet,
   getActiveWalletInfo,
   hasFundedDevnetPayer,
-  loadBurnerSeed,
   loadFundedDevnetSeed,
   resetBurner,
+  sessionUnlock,
   FUNDED_PAYER_ADDRESS,
   type ConnectedWalletInfo,
   type WalletType,
@@ -33,9 +33,12 @@ import {
   network,
   networkLabel,
   openSession,
+  exportBatchTransactionViewingKey,
+  parseViewingKeyBytes,
   runBatchPayroll,
   snapshot,
   verifyAuditReceipt,
+  type VerifyAuditMode,
   type AssetSymbol,
   type BatchPayrollReport,
   type ExecutionResult,
@@ -284,6 +287,10 @@ export function App(): React.ReactElement {
   const [verificationResult, setVerificationResult] = useState<VerificationResult | null>(null);
   const [verificationError, setVerificationError] = useState("");
   const [verifying, setVerifying] = useState(false);
+  const [verifyMode, setVerifyMode] = useState<VerifyAuditMode>("paystub");
+  const [viewingKeyInput, setViewingKeyInput] = useState("");
+  const [useConnectedKey, setUseConnectedKey] = useState(true);
+  const [employerWarned, setEmployerWarned] = useState(false);
 
   // Copy feedback
   const [copiedText, setCopiedText] = useState("");
@@ -292,6 +299,7 @@ export function App(): React.ReactElement {
   const [showWalletModal, setShowWalletModal] = useState(false);
   const [walletConnecting, setWalletConnecting] = useState(false);
   const [walletError, setWalletError] = useState("");
+  const [sessionEpoch, setSessionEpoch] = useState(0);
   const activeWalletInfo = getActiveWalletInfo(session?.signer?.address);
 
   // On-Chain Treasury Leak Scanner state
@@ -304,9 +312,12 @@ export function App(): React.ReactElement {
     setWalletConnecting(true);
     setWalletError("");
     try {
-      await connectBrowserWallet(type);
+      await connectBrowserWallet(type, network);
       setShowWalletModal(false);
-      location.reload();
+      setSession(undefined);
+      setState(undefined);
+      setError("");
+      setSessionEpoch((epoch) => epoch + 1);
     } catch (err: any) {
       setWalletError(err?.message || String(err));
     } finally {
@@ -352,7 +363,7 @@ export function App(): React.ReactElement {
 
   useEffect(() => {
     let cancelled = false;
-    void openSession(loadBurnerSeed(network), onMeasurement)
+    void openSession(sessionUnlock(network), onMeasurement)
       .then(async (opened) => {
         if (cancelled) return;
         setSession(opened);
@@ -368,7 +379,7 @@ export function App(): React.ReactElement {
     return () => {
       cancelled = true;
     };
-  }, [onMeasurement]);
+  }, [onMeasurement, sessionEpoch]);
 
   const run = async (label: string, action: (s: Session) => Promise<bigint | ExecutionResult | undefined>) => {
     if (session === undefined || busy) return;
@@ -481,7 +492,7 @@ export function App(): React.ReactElement {
       );
 
       setProofStage(4);
-      setPayrollProgress(`Stage 4/4: Finalized ${selectedAsset} batch on Solana Devnet!`);
+      setPayrollProgress(`Stage 4/4: Finalized ${selectedAsset} batch on Solana ${networkLabel}!`);
 
       // Attach tamper-evident SHA-256 commitment hash & Ed25519 signature to the report
       const reportWithHash = await attachCommitmentHashes(session, report);
@@ -507,16 +518,45 @@ export function App(): React.ReactElement {
   // Verify Audit Receipt
   const handleVerifyReceipt = async () => {
     if (!session || !receiptInput.trim()) return;
+    if (verifyMode === "employer" && !employerWarned) {
+      setVerificationError("Confirm the employer warning first. That key opens change and every recipient output.");
+      return;
+    }
     setVerifying(true);
     setVerificationError("");
     setVerificationResult(null);
+    let secret: Uint8Array | undefined;
     try {
-      const result = await verifyAuditReceipt(session, receiptInput.trim());
+      if (!useConnectedKey) secret = parseViewingKeyBytes(viewingKeyInput);
+      const result = await verifyAuditReceipt(session, receiptInput.trim(), {
+        mode: verifyMode,
+        ...(secret !== undefined ? { viewingKey: secret } : { useSessionKey: true as const }),
+      });
       setVerificationResult(result);
     } catch (err: any) {
       setVerificationError(err?.message || "Verification failed");
     } finally {
+      secret?.fill(0);
       setVerifying(false);
+    }
+  };
+
+  const handleExportTransactionViewingKey = async () => {
+    if (!session || !employerWarned) return;
+    let signature = receiptInput.trim();
+    try {
+      const parsed = JSON.parse(receiptInput);
+      signature = parsed.txSignature || parsed.chunks?.[0]?.txSignature || signature;
+    } catch {
+      signature = receiptInput.trim();
+    }
+    try {
+      const secretHex = await exportBatchTransactionViewingKey(session, signature);
+      await navigator.clipboard.writeText(secretHex);
+      setCopiedText("tx-viewing-key");
+      setTimeout(() => setCopiedText(""), 2000);
+    } catch (err: any) {
+      setVerificationError(err?.message || "Could not export the transaction viewing key");
     }
   };
 
@@ -764,7 +804,7 @@ export function App(): React.ReactElement {
           {/* Hero Trust Badge */}
           <div className="hero-trust-badge">
             <span>🛡️</span>
-            <span>Built on OtterSec-audited Solana Privacy Rings (Helius) · SPL & Token-2022 Stablecoin Ready</span>
+            <span>Built on Solana Privacy Rings (@heliuslabs/spr) · Groth16 proofs in the browser</span>
           </div>
 
           {/* ========================================================
@@ -831,7 +871,7 @@ export function App(): React.ReactElement {
             {scannerLoading && (
               <div style={{ textAlign: "center", padding: "2.5rem 1rem" }}>
                 <div className="spinner" style={{ width: "2rem", height: "2rem", marginBottom: "0.75rem", borderTopColor: "#EF4444" }} />
-                <div style={{ fontSize: "0.9rem", fontWeight: 600 }}>Querying Helius Devnet RPC & Photon Indexer…</div>
+                <div style={{ fontSize: "0.9rem", fontWeight: 600 }}>Querying Solana RPC for public signatures and balance…</div>
                 <div className="muted" style={{ fontSize: "0.775rem" }}>Reconstructing public transfer graph, timing intervals, and contractor memo tags</div>
               </div>
             )}
@@ -950,7 +990,7 @@ export function App(): React.ReactElement {
                       Defeat On-Chain Burn Rate Leaks with Ciphra
                     </div>
                     <div className="muted" style={{ fontSize: "0.8rem" }}>
-                      Batch up to 14 contractor payouts into 1 Groth16 zero-knowledge proof. No public balances, no scrapable salaries.
+                      One payroll transaction sends at most 14 contractors plus the protocol fee (15 payments) through buildMultiTransferTransaction.
                     </div>
                   </div>
 
@@ -1026,7 +1066,7 @@ export function App(): React.ReactElement {
               ) : (
                 <div>
                   <div style={{ background: "rgba(16, 185, 129, 0.08)", border: "1px solid rgba(16, 185, 129, 0.25)", padding: "0.75rem 1rem", borderRadius: "0.5rem", marginBottom: "1rem", fontSize: "0.8rem", color: "#6EE7B7" }}>
-                    🛡️ <strong>Zero-Knowledge Confidentiality:</strong> Groth16 zk-SNARK proves valid balance subtraction without revealing treasury reserves or individual payout amounts. On Default Rings, amounts are encrypted while recipient addresses remain visible on-chain.
+                    🛡️ <strong>Shielded transfer:</strong> buildMultiTransferTransaction builds one Groth16 proof. The installed SDK states that this proof hides every amount and recipient.
                   </div>
                   <div className="comparison-row">
                     <span style={{ color: "var(--text-secondary)" }}>Employer Treasury</span>
@@ -1054,13 +1094,13 @@ export function App(): React.ReactElement {
             <div className="card-specular bento-card">
               <div>
                 <div className="bento-icon-wrap">⚡</div>
-                <h3 className="bento-title">15-Output Groth16 Batching</h3>
+                <h3 className="bento-title">Multi-recipient Groth16 payroll</h3>
                 <p className="bento-desc">
-                  Disburse payouts to up to 14 contractors plus protocol fees in a single atomic zero-knowledge proof. No recurring gas leaks.
+                  Each run calls buildMultiTransferTransaction. This desk puts at most 14 contractors plus the protocol fee in one call (15 payments). Proving keys pad outputs to 2, 4, 8, or 16 slots.
                 </p>
               </div>
               <div>
-                <span className="bento-tag">1 PROOF · 15 OUTPUTS</span>
+                <span className="bento-tag">15 PAYMENTS · SHAPES 2/4/8/16</span>
               </div>
             </div>
 
@@ -1624,7 +1664,7 @@ export function App(): React.ReactElement {
                     Selective Cryptographic Audit Verifier
                   </h2>
                   <p className="muted" style={{ fontSize: "0.8rem" }}>
-                    Verify a single payroll run or contractor disbursement on-chain without revealing the employer's treasury balance.
+                    Amounts come from decrypting the indexed ciphertext. A pasted receipt is only a cross-check.
                   </p>
                 </div>
 
@@ -1647,22 +1687,84 @@ export function App(): React.ReactElement {
                 </div>
               </div>
 
+              <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem", flexWrap: "wrap" }}>
+                <button
+                  className={`btn btn-sm ${verifyMode === "paystub" ? "btn-primary" : "btn-secondary"}`}
+                  onClick={() => setVerifyMode("paystub")}
+                  type="button"
+                >
+                  Single-recipient paystub
+                </button>
+                <button
+                  className={`btn btn-sm ${verifyMode === "employer" ? "btn-primary" : "btn-secondary"}`}
+                  onClick={() => setVerifyMode("employer")}
+                  type="button"
+                >
+                  Employer / CPA batch audit
+                </button>
+              </div>
+              <p className="muted" style={{ fontSize: "0.78rem", marginBottom: "0.75rem" }}>
+                {verifyMode === "paystub"
+                  ? "Paystub mode calls decryptUtxo on the recipient viewing key. It opens only the note encrypted to that key. Other recipients and sender change stay closed."
+                  : "Batch audit derives transactionViewingKey(firstNullifier) and calls decryptSlotEphemeral on every slot. That opens sender change and every recipient."}
+              </p>
+              {verifyMode === "employer" && (
+                <label style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start", fontSize: "0.78rem", marginBottom: "0.75rem" }}>
+                  <input
+                    type="checkbox"
+                    checked={employerWarned}
+                    onChange={(event) => setEmployerWarned(event.target.checked)}
+                  />
+                  <span>
+                    I understand this transaction viewing key reveals change and every recipient in the batch. It is not a single-contractor paystub.
+                  </span>
+                </label>
+              )}
+              <label style={{ display: "flex", gap: "0.5rem", alignItems: "center", fontSize: "0.78rem", marginBottom: "0.5rem" }}>
+                <input
+                  type="checkbox"
+                  checked={useConnectedKey}
+                  onChange={(event) => setUseConnectedKey(event.target.checked)}
+                />
+                Use the connected wallet. The viewing key is not written to Local Storage.
+              </label>
+              {!useConnectedKey && (
+                <textarea
+                  className="csv-textarea"
+                  placeholder="32-byte viewing key, hex or base58. Not the 64-byte ed25519 derivation signature."
+                  value={viewingKeyInput}
+                  onChange={(event) => setViewingKeyInput(event.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                  style={{ height: "4.5rem", marginBottom: "0.75rem" }}
+                />
+              )}
               <textarea
                 className="csv-textarea"
-                placeholder='Paste Ciphra audit receipt JSON (e.g. {"protocol": "Ciphra", "txSignature": "...", ...})'
+                placeholder="Paste a transaction signature, or a Ciphra receipt JSON. Receipt amounts are checked against the decrypted notes."
                 value={receiptInput}
                 onChange={(e) => setReceiptInput(e.target.value)}
                 style={{ height: "8.5rem", marginBottom: "1rem" }}
               />
 
-              <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.5rem" }}>
+              <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.5rem", flexWrap: "wrap" }}>
                 <button
                   className="btn btn-primary"
-                  disabled={verifying || !receiptInput.trim()}
+                  disabled={verifying || !receiptInput.trim() || (!useConnectedKey && !viewingKeyInput.trim())}
                   onClick={handleVerifyReceipt}
                 >
-                  {verifying ? "Querying Helius Devnet RPC & Photon…" : "🔍 Verify Audit Receipt On-Chain"}
+                  {verifying ? "Decrypting indexed notes…" : "Decrypt and verify on-chain"}
                 </button>
+                {verifyMode === "employer" && (
+                  <button
+                    className="btn btn-secondary"
+                    type="button"
+                    disabled={!employerWarned || !receiptInput.trim()}
+                    onClick={handleExportTransactionViewingKey}
+                  >
+                    {copiedText === "tx-viewing-key" ? "Copied transaction viewing key" : "Export batch transaction viewing key"}
+                  </button>
+                )}
                 <button
                   className="btn btn-secondary"
                   onClick={() => {
@@ -1684,10 +1786,10 @@ export function App(): React.ReactElement {
               {/* Holographic Verified Certificate Card */}
               {verificationResult && (
                 <div className="holographic-cert">
-                  <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem", padding: "0.25rem 0.65rem", borderRadius: "9999px", background: "rgba(16, 185, 129, 0.15)", border: "1px solid rgba(16, 185, 129, 0.4)", color: "#34D399", fontSize: "0.75rem", fontWeight: 700, marginBottom: "0.75rem", flexWrap: "wrap" }}>
+                  <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem", padding: "0.25rem 0.65rem", borderRadius: "9999px", background: verificationResult.integrity === "TAMPERED" ? "rgba(239, 68, 68, 0.15)" : "rgba(16, 185, 129, 0.15)", border: `1px solid ${verificationResult.integrity === "TAMPERED" ? "rgba(239, 68, 68, 0.4)" : "rgba(16, 185, 129, 0.4)"}`, color: verificationResult.integrity === "TAMPERED" ? "#FCA5A5" : "#34D399", fontSize: "0.75rem", fontWeight: 700, marginBottom: "0.75rem", flexWrap: "wrap" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: "0.35rem" }}>
                       <span>🛡️</span>
-                      <span>CRYPTOGRAPHICALLY VERIFIED ON-CHAIN</span>
+                      <span>{verificationResult.integrity === "TAMPERED" ? "TAMPERED — RECEIPT ≠ DECRYPTED NOTES" : "DECRYPTED FROM THE INDEXED TRANSACTION"}</span>
                     </div>
                     {verificationResult.payerSignatureVerified && (
                       <span style={{ paddingLeft: "0.5rem", borderLeft: "1px solid rgba(16, 185, 129, 0.4)", color: "#10B981" }}>
@@ -1820,24 +1922,31 @@ export function App(): React.ReactElement {
 
                   {/* Disclosed Payouts Table */}
                   <div style={{ marginTop: "1.25rem" }}>
-                    <h4 style={{ fontSize: "0.9rem", fontWeight: 600, marginBottom: "0.5rem" }}>Verified Disclosed Outputs</h4>
+                    <h4 style={{ fontSize: "0.9rem", fontWeight: 600, marginBottom: "0.5rem" }}>
+                    On-chain decrypted outputs ({verificationResult.integrity})
+                  </h4>
+                  {verificationResult.integrity === "TAMPERED" && (
+                    <p style={{ color: "#FCA5A5", fontSize: "0.8rem" }}>{verificationResult.tamperReason}</p>
+                  )}
                     <div className="payroll-table-wrap">
                       <table className="payroll-table">
                         <thead>
                           <tr>
-                            <th>Recipient</th>
-                            <th>Amount ({verificationResult.asset || "SOL"})</th>
-                            <th>Memo</th>
+                            <th>Slot</th>
+                            <th>Role</th>
+                            <th>Mint</th>
+                            <th>Amount</th>
+                            <th>Viewing key</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {verificationResult.disclosedPayouts.map((p, i) => (
-                            <tr key={i}>
-                              <td className="mono" style={{ fontSize: "0.8rem" }}>{p.recipient}</td>
-                              <td className="mono" style={{ color: verificationResult.asset === "USDC" ? "#60A5FA" : "#34D399", fontWeight: 600 }}>
-                                {p.amount ?? p.amountSol} {verificationResult.asset || "SOL"}
-                              </td>
-                              <td>{p.memo}</td>
+                          {verificationResult.decryptedOutputs.map((note) => (
+                            <tr key={`${note.signature}-${note.slotIndex}`}>
+                              <td className="mono">{note.slotIndex}</td>
+                              <td>{note.role}</td>
+                              <td className="mono" style={{ fontSize: "0.75rem" }}>{note.mint}</td>
+                              <td className="mono" style={{ fontWeight: 600 }}>{note.amountDisplay}</td>
+                              <td className="mono" style={{ fontSize: "0.75rem" }}>{note.recipientViewingKey.slice(0, 12)}…</td>
                             </tr>
                           ))}
                         </tbody>
@@ -1910,8 +2019,8 @@ export function App(): React.ReactElement {
               <div className={`stepper-step ${proofStage === 4 ? "active" : ""}`}>
                 <div className="step-indicator">{proofStage === 4 ? "✓" : "4"}</div>
                 <div className="step-info">
-                  <span className="step-title">Finalized on Solana Devnet</span>
-                  <span className="step-desc">Confirming block slot via Helius RPC & Photon indexer</span>
+                  <span className="step-title">Finalized on Solana {networkLabel}</span>
+                  <span className="step-desc">Confirming the transaction slot on the Solana RPC</span>
                 </div>
               </div>
             </div>
@@ -2294,7 +2403,7 @@ export function App(): React.ReactElement {
       <footer style={{ marginTop: "4rem", textAlign: "center", borderTop: "1px solid var(--border-card)", paddingTop: "1.25rem", paddingBottom: "2rem" }}>
         <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem", padding: "0.25rem 0.75rem", borderRadius: "9999px", background: "rgba(255, 255, 255, 0.03)", border: "1px solid rgba(255, 255, 255, 0.08)", fontSize: "0.75rem", color: "var(--text-secondary)" }}>
           <span>🛡️</span>
-          <span>Built on OtterSec-audited Solana Privacy Rings (Helius) · SPL & Token-2022 Stablecoin Ready</span>
+          <span>Built on Solana Privacy Rings (@heliuslabs/spr) · Groth16 proofs in the browser</span>
         </div>
         <p className="muted" style={{ fontSize: "0.75rem" }}>
           Ciphra Powered by Solana Privacy Rings & Helius TEE Attested Prover · {keys}

@@ -2,11 +2,10 @@
 
 [![Solana Privacy Rings](https://img.shields.io/badge/Solana-Privacy%20Rings-06B6D4?style=flat-square&logo=solana)](https://github.com/helius-labs)
 [![Groth16 In-Browser Proving](https://img.shields.io/badge/Prover-Groth16%20WASM%20Multithreaded-10B981?style=flat-square)](https://github.com/helius-labs)
-[![Audit Status](https://img.shields.io/badge/Security%20Audit-OtterSec%20Verified-8B5CF6?style=flat-square)](https://osec.io/)
 [![Asset Support](https://img.shields.io/badge/Assets-SOL%20%7C%20Confidential%20USDC-F59E0B?style=flat-square)](https://spl.solana.com/token)
 [![Cross-Origin Isolation](https://img.shields.io/badge/COOP%2FCOEP-Ready-3B82F6?style=flat-square)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cross-Origin-Opener-Policy)
 
-**Ciphra** is an institutional zero-knowledge payroll protocol built directly on Solana Privacy Rings (`@heliuslabs/spr`). It enables Web3 founders, DAOs, and crypto-native enterprises to disburse contractor compensation, founder salaries, and vendor retainers with encrypted payout amounts and shielded treasury balances—without leaking company burn rate, runway, or internal compensation hierarchy to public blockchain explorers. On permissionless Default Rings, amounts are encrypted while recipient addresses remain visible on-chain.
+**Ciphra** is a payroll app on Solana Privacy Rings (`@heliuslabs/spr`). `buildMultiTransferTransaction` states that its proof hides every amount and recipient. The fee-paying Solana account remains the transaction signer.
 
 ---
 
@@ -17,7 +16,7 @@ Standard Solana transfers broadcast every payer, recipient, and transfer amount 
 2. **Team Salary Hierarchy**: Exact compensation differences between senior engineers, auditors, and executives.
 3. **Temporal Payout Clustering**: Predictable monthly or bi-weekly disbursement dates that correlate on-chain addresses directly with specific team members.
 
-**Ciphra solves this at the protocol layer** by combining zero-knowledge UTXO notes, 15-output Groth16 batching, anti-correlation timing jitter, and selective cryptographic audit receipts with tamper-evident SHA-256 commitment binding verified on-chain.
+Payroll runs call `buildMultiTransferTransaction` (1 to 15 payments). Optional timing jitter spaces chunks. A `ciphra_payroll_journal` record is written before the first send and skips chunks already confirmed on chain. `/verify` decrypts indexed notes: recipient `decryptUtxo` for one paystub, or the sender `transactionViewingKey` and `decryptSlotEphemeral` for a full batch.
 
 ---
 
@@ -33,8 +32,8 @@ Standard Solana transfers broadcast every payer, recipient, and transfer amount 
 +-----------------------------------------------------------------------------------+
 |                         IN-BROWSER GROTH16 PROVER                                 |
 |   - Multithreaded WebAssembly Prover (@heliuslabs/spr-web-prover)                 |
-|   - Local zero-knowledge witness generation (witnesses never leave device)        |
-|   - 15-Output Groth16 proof batching (up to 14 contractors + protocol fee)       |
+|   - Local witness generation (witnesses are not sent to the prover URL)           |
+|   - buildMultiTransferTransaction: up to 15 payments; shapes pad to 2/4/8/16      |
 +-----------------------------------------------------------------------------------+
                                       |
                 +---------------------+---------------------+
@@ -42,7 +41,7 @@ Standard Solana transfers broadcast every payer, recipient, and transfer amount 
 +-------------------------------+           +-------------------------------+
 |       NATIVE SOL POOL         |           |    CONFIDENTIAL USDC POOL     |
 | - 9 Decimals                  |           | - 6 Decimals                  |
-| - Program: ring1GaLC...XANW   |           | - Devnet Mint: 3XTt...RoPf    |
+| - Program: ring1GaLC...XANW   |           | - Devnet mint default: 4zMMC...DncDU |
 | - Encrypted UTXO State Tree   |           | - Mainnet Mint: EPjF...t1v    |
 +-------------------------------+           +-------------------------------+
                 |                                           |
@@ -51,9 +50,9 @@ Standard Solana transfers broadcast every payer, recipient, and transfer amount 
                                       v
 +-----------------------------------------------------------------------------------+
 |                       SOLANA PRIVACY RINGS ON-CHAIN POOL                          |
-|   - OtterSec-Audited Groth16 Verifier Contract (Helius)                             |
-|   - Nullifier verification (double-spend prevention without unmasking history)    |
-|   - Stealth Address Derivation & Post-Quantum-Resistant Encrypted Notes           |
+|   - Groth16 shielded-pool program used by @heliuslabs/spr                          |
+|   - Nullifiers so a spent note cannot be spent again                              |
+|   - Shielded keys from LocalKeys.fromDerivationSeed; notes open with a viewing key |
 +-----------------------------------------------------------------------------------+
                                       |
                                       v
@@ -64,11 +63,15 @@ Standard Solana transfers broadcast every payer, recipient, and transfer amount 
 +-----------------------------------------------------------------------------------+
 ```
 
-### 1. 15-Output Groth16 Batching
-Instead of executing sequential public transfers that leak recurring patterns, Ciphra compiles up to **14 contractor payouts plus the protocol fee into a single atomic Groth16 zero-knowledge proof** (`buildMultiTransferTransaction`).
-- Validates balance conservation: $\sum \text{Inputs} = \sum \text{Outputs} + \text{Fee}$.
-- Verifies nullifier uniqueness without revealing which historical notes were spent.
-- Generates 15 encrypted Pedersen commitment outputs on Solana Privacy Rings in one transaction.
+### 1. Multi-recipient transfers
+`runBatchPayroll` splits recipients into chunks of 14 and appends the protocol fee as one more payment, then calls `buildMultiTransferTransaction`.
+
+Installed `@heliuslabs/spr@0.9.0-alpha` types:
+- `MultiTransferTransactionParams.payments` is documented as one to fifteen payments.
+- `MAX_TRANSFER_PAYMENTS` is the widest `SPP_SUPPORTED_SHAPES` output count minus one. Those shapes use 2, 4, 8, or 16 outputs, so the payment cap is 15. A 15-payment transfer is padded into a 16-output shape, which leaves room for one change output.
+- This repository does not ship a separate 15-output circuit.
+
+The local browser prover refuses a proof whose input list is longer than 8 (`MAX_LOCAL_INPUTS`). Wider spends are expected to merge first through the attested prover (`proverTee`).
 
 ### 2. Dual-Asset Confidentiality (SOL & USDC)
 Ciphra natively supports both Native Solana (`SOL`, 9 decimals) and Confidential SPL Token (`USDC`, 6 decimals):
@@ -82,11 +85,11 @@ Blockchain analytics firms use temporal clustering to correlate batches executed
 Privacy does not mean untraceability for legitimate accounting. Ciphra provides institutional audit tooling:
 - **Batch Audit Receipts**: Exported `.json` containing tx signatures, block slots, asset mint, an Ed25519 digital signature from the payer (`payerSignature`), and a deterministic **SHA-256 commitment hash** (`receiptCommitmentHash`) over canonical `{ network, programId, payerPubkey, asset, mint, chunks }`.
 - **Single-Contractor Selective Receipts**: Allows an employer to prove payment to one specific contractor (for tax or dispute resolution) without unmasking other team members or total treasury reserves. Each receipt includes its own Ed25519 digital attestation and tamper-evident SHA-256 digest.
-- **On-Chain Audit Verifier (`/verify`)**: Validates receipts by: (a) cryptographically verifying the payer's Ed25519 digital signature over `receiptCommitmentHash`; (b) recomputing the SHA-256 digest over all canonical chunks to detect any tampering; (c) confirming live RPC `getTransaction` on every chunk with `meta.err === null`, matching block slots, and explicit invocation of the Solana Privacy Rings program (`ring1GaLC…XANW`); (d) confirming `payerPubkey` matches the on-chain transaction signer (`accountKeys[0]`). The certificate displays: "✓ Ed25519 Payer Authenticated" and "Verified On-Chain Execution & Tamper-Evident Receipt Binding".
+- **On-Chain Audit Verifier (`/verify`)**: Requires `getTransaction` with `maxSupportedTransactionVersion` and an indexer fetch. Account keys must include the shielded-pool program. There is no `getSignatureStatuses` fallback. Paystub verification calls `ViewingKey.decryptUtxo` and shows only that note. Employer verification calls `transactionViewingKey(firstNullifier)` and `decryptSlotEphemeral` on every slot, and the page warns before that key is used or exported. If a receipt JSON is attached, claimed amounts that are absent from the decrypted outputs are marked `TAMPERED`.
 - **1-Click CPA Spreadsheet Export**: Generates an accounting CSV (`Date,Run_ID,Asset,Mint,Contractor_Address,Role_Memo,Disbursed_Amount,Protocol_Fee,Tx_Signature,Block_Slot`).
 
-### 5. OtterSec Security Audit
-The underlying Solana Privacy Rings protocol circuits, state trees, and verifier contracts are audited by **OtterSec** (Helius's protocol-level audit). The prover utilizes attested AWS Nitro Enclaves (`proverTee`) for note consolidations exceeding 8 inputs. Ciphra is built on this OtterSec-audited foundation.
+### 5. What this repository does not claim
+This repository does not include an audit report, and it does not claim an OtterSec review, post-quantum encryption, or a fixed error-free build. Merges that exceed the local 8-input limit use the deployment's attested prover client (`proverTee` on `createSprClient`).
 
 ---
 
@@ -96,10 +99,10 @@ Ciphra supports flexible onboarding tailored for both live production and develo
 
 | Wallet Mode | Description | How It Works |
 | :--- | :--- | :--- |
-| **🟣 Phantom** | Standard Solana browser extension | Connects via `window.phantom.solana`. Deterministic 32-byte ZK session seed derived from one-time off-chain authentication signature (`ed25519DerivationMessage`). |
-| **🟠 Solflare** | Solana web & hardware wallet extension | Connects via `window.solflare`. Derives ZK session seed via off-chain auth signature without exposing seed material. |
-| **⚡ Demo Mode (Funded Devnet Payer)** | Zero-setup testing for judges & evaluators | Automatically loads pre-funded Devnet account `CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1` (~9.98 SOL + 100,000 test USDC). Proves in-browser in 1 click. |
-| **🔄 Ephemeral Burner** | Isolated testing for engineers | Generates random isolated keypair in browser storage. |
+| **🟣 Phantom** | Standard Solana browser extension | Connects via `window.phantom.solana`. The wallet signs `ed25519DerivationMessage(publicKey)`. That 64-byte signature is the `derivationSeed` for `LocalKeys.fromDerivationSeed` and stays in memory until disconnect or page hide. |
+| **🟠 Solflare** | Solana web & hardware wallet extension | Connects via `window.solflare`. Same derivation message and in-memory seed as Phantom. |
+| **⚡ Demo Mode (Funded Devnet Payer)** | Testing when a key is configured | Reads `VITE_FUNDED_KEYPAIR` into memory for devnet. The public address constant is `CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1`. The key is not written to browser storage. |
+| **🔄 Ephemeral Burner** | Isolated testing for engineers | `crypto.getRandomValues` creates a 32-byte key in memory. It is dropped on reset, disconnect, or page hide. |
 
 ---
 
@@ -156,12 +159,12 @@ Open `http://127.0.0.1:5179/` in your browser.
 ```bash
 npm run build
 ```
-Executes TypeScript typecheck (`tsc --noEmit`) and Vite production bundle. Zero errors guaranteed.
+Runs `tsc --noEmit` and the Vite production bundle.
 
 ---
 
 ## 7. License & Credits
 - **Architect & Developer**: [Tejanadh](https://github.com/Tejanadh)
 - **Protocol Foundation**: Built on **Solana Privacy Rings** by Helius Labs.
-- **Security**: Built on **OtterSec**-audited Solana Privacy Rings (Helius).
+- **Protocol dependency**: Solana Privacy Rings, `@heliuslabs/spr`.
 - **License**: Apache-2.0 License.

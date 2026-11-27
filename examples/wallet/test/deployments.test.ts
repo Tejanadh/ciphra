@@ -20,23 +20,30 @@ test("deployment pins agree with the SDK and select signed policies by network",
   }
 });
 
-test("demo keys stay separate across networks and preserve the old deployment's key", () => {
-  const storage = new Map([["zolana-example-burner", "01".repeat(32)]]);
+test("session keys stay in memory and leftover browser secrets are deleted", () => {
+  const storage = new Map<string, string>([["zolana-example-burner", "01".repeat(32)]]);
   const previous = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
     getItem: (key: string) => storage.get(key) ?? null,
     setItem: (key: string, value: string) => storage.set(key, value),
     removeItem: (key: string) => storage.delete(key),
+    key: (index: number) => [...storage.keys()][index] ?? null,
+    get length() { return storage.size; },
   } });
   try {
     const devnet = loadBurnerSeed("devnet");
     const mainnet = loadBurnerSeed("mainnet");
+    assert.equal(devnet.length, 32);
+    assert.equal(mainnet.length, 32);
     assert.notDeepEqual(devnet, mainnet);
     assert.deepEqual(loadBurnerSeed("devnet"), devnet);
-    resetBurner("devnet");
+    assert.equal(storage.has("zolana-example-burner"), false);
     assert.equal(storage.has(burnerStorageKey("devnet")), false);
+    assert.equal(storage.size, 0);
+    resetBurner("devnet");
+    assert.notDeepEqual(loadBurnerSeed("devnet"), devnet);
     assert.deepEqual(loadBurnerSeed("mainnet"), mainnet);
-    assert.equal(storage.get("zolana-example-burner"), "01".repeat(32));
+    assert.equal(storage.size, 0);
   } finally {
     if (previous) Object.defineProperty(globalThis, "localStorage", previous);
     else Reflect.deleteProperty(globalThis, "localStorage");
