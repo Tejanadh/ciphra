@@ -621,7 +621,7 @@ export function App(): React.ReactElement {
             <em>for a public chain.</em>
           </h1>
           <p className="hero-subheadline">
-            Pay contractors without publishing salaries, recipients, or the company burn rate. Proofs run in the browser. A paystub opens one note. A batch audit opens the rest, on purpose.
+            Pay contractors without publishing salaries or the company burn rate. The Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit. Proofs run in the browser. A paystub opens one note. A batch audit opens the rest, on purpose.
           </p>
           <div className="hero-actions">
             <button
@@ -914,7 +914,7 @@ export function App(): React.ReactElement {
               ) : (
                 <div>
                   <div style={{ background: "rgba(16, 185, 129, 0.08)", border: "1px solid rgba(16, 185, 129, 0.25)", padding: "0.75rem 1rem", borderRadius: "0.5rem", marginBottom: "1rem", fontSize: "0.8rem", color: "#6EE7B7" }}>
-                    🛡️ <strong>Shielded transfer:</strong> buildMultiTransferTransaction builds one Groth16 proof. The installed SDK states that this proof hides every amount and recipient.
+                    🛡️ <strong>Shielded transfer:</strong> buildMultiTransferTransaction builds one Groth16 proof. The Helius Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit.
                   </div>
                   <div className="comparison-row">
                     <span style={{ color: "var(--text-secondary)" }}>Employer Treasury</span>
@@ -948,7 +948,7 @@ export function App(): React.ReactElement {
               <div>
                 <h3>Payroll</h3>
                 <p>
-                  One call to buildMultiTransferTransaction. Up to 14 contractors plus the protocol fee. The proof hides amounts and recipients. Proving stays on this device until you opt into a remote merge.
+                  One call to buildMultiTransferTransaction. Up to 14 contractors plus the protocol fee. The proof hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit. Proving stays on this device until you opt into a remote merge.
                 </p>
               </div>
               <button className="btn btn-secondary" type="button" onClick={() => { setViewMode("app"); setActiveTab("payroll"); }}>
@@ -1322,6 +1322,7 @@ export function App(): React.ReactElement {
     return (
       <main className="app-container">
         <header className="nav-header">
+          <p className="demo-banner" role="status">Devnet demo — not for production funds.</p>
           <div className="brand-wrap" onClick={() => setViewMode("landing")}>
             <span className="brand-text">Ciphra</span>
             <span className="brand-pill">Confidential payroll</span>
@@ -1413,6 +1414,7 @@ export function App(): React.ReactElement {
     <main className="app-container">
       {/* Top Navbar */}
       <header className="nav-header">
+        <p className="demo-banner" role="status">Devnet demo — not for production funds.</p>
         <div className="brand-wrap" onClick={() => setViewMode("landing")}>
           <div className="brand-logo">🛡️</div>
           <div>
