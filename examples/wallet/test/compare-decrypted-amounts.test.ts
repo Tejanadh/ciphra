@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ShieldedAddress, ShieldedPublicKey, X25519PublicKey, bytes32 } from "@heliuslabs/spr/keypair";
-import { compareDecryptedAmounts, type AuditNote } from "../src/compare-decrypted-amounts.ts";
+import { auditModeForConnectedWallet, compareDecryptedAmounts, type AuditNote } from "../src/compare-decrypted-amounts.ts";
 
 const DECIMALS = 9;
 const SENDER = "CochByMjwdvZTWVPK4GqV3po66TmnjLvBxsC3wexTHQ1";
@@ -360,7 +360,20 @@ test("4. paystub mode binds to this recipient and refuses receipts with no shiel
     { paystubShieldedAddress: BOB },
   );
   assert.equal(missingViewer.integrity, "TAMPERED");
-  assert.equal(missingViewer.reason, "The recipient shielded address is missing from the receipt.");
+  assert.equal(missingViewer.reason, "This viewing key is not one of the shielded addresses on the receipt.");
+
+  const senderCheckingBatch = auditModeForConnectedWallet(
+    "paystub",
+    SENDER_SHIELDED,
+    [{ payouts: [line(100n, alice.shielded), line(200n, bobPerson.shielded)] }],
+  );
+  assert.equal(senderCheckingBatch, "employer");
+  const recipientCheckingOwnLine = auditModeForConnectedWallet(
+    "paystub",
+    bobPerson.shielded,
+    [{ payouts: [line(100n, alice.shielded), line(200n, bobPerson.shielded)] }],
+  );
+  assert.equal(recipientCheckingOwnLine, "paystub");
 
   const pastedKey = compareDecryptedAmounts(
     "paystub",
