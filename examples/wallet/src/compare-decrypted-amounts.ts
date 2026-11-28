@@ -52,7 +52,7 @@ const UNSUPPORTED_AMOUNT = "Unsupported receipt — an amount could not be read.
  * Program transfer into the tree account. It is not a confidential output, so
  * it is not a decrypted note and it is not part of this comparison.
  *
- * The app's 0.25% protocol fee is an extra confidential payment. It decrypts
+ * The app's 0.50% protocol fee is an extra confidential payment. It decrypts
  * as a note owned by the fee collector's viewing key. When that collector is
  * the sender, `decryptIndexedTransaction` marks it `sender-change` and this
  * function leaves it out of the payout multiset with the rest of the change.
@@ -112,11 +112,11 @@ export function compareDecryptedAmounts(
         reason: "Unsupported receipt — paystub verification needs the recipient shielded address.",
       };
     }
-    const ownRows = payoutRows.filter((row) => String(row.shieldedAddress).trim().toLowerCase() === viewer);
+    const ownRows = payoutRows.filter((row) => samePayee(String(row.shieldedAddress), viewer));
     if (ownRows.length === 0) {
       return {
         integrity: "TAMPERED",
-        reason: "The recipient shielded address is missing from the receipt.",
+        reason: "This viewing key is not one of the shielded addresses on the receipt.",
       };
     }
     const claimed = readClaimedUnits(ownRows, decimals);
@@ -177,6 +177,40 @@ export function compareDecryptedAmounts(
     onChain.push(pairKey(viewingKey, BigInt(note.amountBaseUnits)));
   }
   return multisetVerdict(onChain, claimed);
+}
+
+/**
+ * Paystub mode checks one viewing key. A batch receipt verified by the sender
+ * does not list that sender as a payee, so the caller must open every output
+ * and use employer mode instead of reporting the payee field as missing.
+ */
+export function auditModeForConnectedWallet(
+  requested: "paystub" | "employer",
+  viewerShieldedAddress: string | undefined,
+  chunks: readonly any[],
+): "paystub" | "employer" {
+  if (requested === "employer") return "employer";
+  if (viewerShieldedAddress === undefined || viewerShieldedAddress.trim() === "") return "paystub";
+  return paystubViewerIsListed(viewerShieldedAddress, chunks) ? "paystub" : "employer";
+}
+
+export function paystubViewerIsListed(viewer: string, chunks: readonly any[]): boolean {
+  for (const chunk of chunks) {
+    const rows = Array.isArray(chunk?.payouts) ? chunk.payouts : [];
+    for (const row of rows) {
+      if (typeof row?.shieldedAddress === "string" && samePayee(row.shieldedAddress, viewer)) return true;
+    }
+  }
+  return false;
+}
+
+function samePayee(rowAddress: string, viewer: string): boolean {
+  const listed = rowAddress.trim().toLowerCase().replace(/^0x/, "");
+  const needle = viewer.trim().toLowerCase().replace(/^0x/, "");
+  if (listed !== "" && listed === needle) return true;
+  const listedKey = viewingKeyFromShieldedAddress(listed);
+  const viewerKey = viewingKeyFromShieldedAddress(needle);
+  return listedKey !== undefined && listedKey === viewerKey;
 }
 
 function feeOwnedBySender(fee: any, context: CompareAuditContext): "yes" | "no" | "unknown" {

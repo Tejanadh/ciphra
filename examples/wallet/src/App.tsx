@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { formatAmount, parseAmount } from "@heliuslabs/spr";
 import { isAddress } from "@solana/kit";
+import {
+  createEphemeralBurner,
+  quoteStealthBurnerSwapStub,
+  stealthUnshieldCap,
+  wipeEphemeralBurner,
+  type EphemeralBurner,
+  type StealthSwapQuote,
+} from "./stealthBurners.js";
 import { shapeByLabel, type KeyProgress, type Measurement } from "@heliuslabs/spr-web-prover";
 
 import {
@@ -22,6 +30,7 @@ import {
 } from "./scanner.js";
 import {
   ASSETS,
+  DEFAULT_PROTOCOL_FEE_BPS,
   DEVNET_USDC_MINT,
   SOL_MINT,
   USDC_MINT,
@@ -37,7 +46,9 @@ import {
   parseViewingKeyBytes,
   PERSIST_PAYROLL_HISTORY_KEY,
   RECENT_PAYROLL_RUNS_KEY,
+  resolveProtocolFeeCollector,
   runBatchPayroll,
+  sweepBurnerToShield,
   wipeLocalPayrollHistory,
   snapshot,
   verifyAuditReceipt,
@@ -231,7 +242,7 @@ export function App(): React.ReactElement {
   const [proofStage, setProofStage] = useState<1 | 2 | 3 | 4>(1);
 
   // App navigation tab: "payroll" | "contractor" | "verify"
-  const [activeTab, setActiveTab] = useState<"payroll" | "contractor" | "verify">("payroll");
+  const [activeTab, setActiveTab] = useState<"payroll" | "contractor" | "verify" | "stealth">("payroll");
 
   // Active Payroll Currency: "SOL" | "USDC"
   const [selectedAsset, setSelectedAsset] = useState<AssetSymbol>("SOL");
@@ -241,6 +252,11 @@ export function App(): React.ReactElement {
   const [showUnshieldModal, setShowUnshieldModal] = useState(false);
   const [shieldAmount, setShieldAmount] = useState("0.02");
   const [unshieldAmount, setUnshieldAmount] = useState("0.002");
+  const [burner, setBurner] = useState<EphemeralBurner>();
+  const [burnerAsset, setBurnerAsset] = useState<AssetSymbol>("SOL");
+  const [burnerAmount, setBurnerAmount] = useState("0.01");
+  const [swapQuote, setSwapQuote] = useState<StealthSwapQuote>();
+  const [burnerNote, setBurnerNote] = useState("");
 
   // Switch active asset and populate corresponding amounts
   const handleSelectAsset = (asset: AssetSymbol) => {
@@ -502,13 +518,13 @@ export function App(): React.ReactElement {
         setPayrollProgress(`Stage 2/4: Generating in-browser Groth16 zero-knowledge proof for ${selectedAsset} batch…`);
       }, 700);
 
-      const feeCollector = session.signer.address;
+      const feeCollector = resolveProtocolFeeCollector(session.signer.address);
       const report = await runBatchPayroll(
         session,
         validRecipients,
         {
           asset: selectedAsset,
-          protocolFeeBps: 25, // 0.25% protocol fee
+          protocolFeeBps: DEFAULT_PROTOCOL_FEE_BPS,
           feeCollector,
           antiCorrelationJitter,
           onProgress: (status: string) => {
@@ -606,7 +622,7 @@ export function App(): React.ReactElement {
 
   // Payroll desk totals with float precision formatting
   const totalPayrollNum = contractors.reduce((acc, c) => acc + (Number(c.amountSol ?? c.amount) || 0), 0);
-  const ciphraFeeNum = totalPayrollNum * 0.0025;
+  const ciphraFeeNum = totalPayrollNum * (DEFAULT_PROTOCOL_FEE_BPS / 10_000);
   const totalRequiredNum = totalPayrollNum + ciphraFeeNum;
   const totalPayrollStr = `${formatSol(totalPayrollNum)} ${selectedAsset}`;
   const ciphraFeeStr = `${formatSol(ciphraFeeNum)} ${selectedAsset}`;
@@ -621,7 +637,7 @@ export function App(): React.ReactElement {
             <em>for a public chain.</em>
           </h1>
           <p className="hero-subheadline">
-            Pay contractors without publishing salaries, recipients, or the company burn rate. Proofs run in the browser. A paystub opens one note. A batch audit opens the rest, on purpose.
+            Pay contractors without publishing salaries or the company burn rate. The Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit. Proofs run in the browser. A paystub opens one note. A batch audit opens the rest, on purpose.
           </p>
           <div className="hero-actions">
             <button
@@ -914,7 +930,7 @@ export function App(): React.ReactElement {
               ) : (
                 <div>
                   <div style={{ background: "rgba(16, 185, 129, 0.08)", border: "1px solid rgba(16, 185, 129, 0.25)", padding: "0.75rem 1rem", borderRadius: "0.5rem", marginBottom: "1rem", fontSize: "0.8rem", color: "#6EE7B7" }}>
-                    🛡️ <strong>Shielded transfer:</strong> buildMultiTransferTransaction builds one Groth16 proof. The installed SDK states that this proof hides every amount and recipient.
+                    🛡️ <strong>Shielded transfer:</strong> buildMultiTransferTransaction builds one Groth16 proof. The Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit.
                   </div>
                   <div className="comparison-row">
                     <span style={{ color: "var(--text-secondary)" }}>Employer Treasury</span>
@@ -929,8 +945,8 @@ export function App(): React.ReactElement {
                     <span className="cipher-block">0x3d02••••77ca [ENCRYPTED NOTE]</span>
                   </div>
                   <div className="comparison-row">
-                    <span style={{ color: "var(--text-secondary)" }}>Protocol Fee (0.25%)</span>
-                    <span style={{ color: "#34D399" }}>0.000011 SOL (Ciphra Protocol Vault)</span>
+                    <span style={{ color: "var(--text-secondary)" }}>Protocol Fee (0.50%)</span>
+                    <span style={{ color: "#34D399" }}>0.000022 SOL (Ciphra Protocol Vault)</span>
                   </div>
                 </div>
               )}
@@ -948,7 +964,7 @@ export function App(): React.ReactElement {
               <div>
                 <h3>Payroll</h3>
                 <p>
-                  One call to buildMultiTransferTransaction. Up to 14 contractors plus the protocol fee. The proof hides amounts and recipients. Proving stays on this device until you opt into a remote merge.
+                  One call to buildMultiTransferTransaction. Up to 14 contractors plus the protocol fee. The Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit. Proving stays on this device until you opt into a remote merge.
                 </p>
               </div>
               <button className="btn btn-secondary" type="button" onClick={() => { setViewMode("app"); setActiveTab("payroll"); }}>
@@ -1036,7 +1052,7 @@ export function App(): React.ReactElement {
               </div>
               <p className="muted" style={{ fontSize: "0.78rem", marginBottom: "0.75rem" }}>
                 {verifyMode === "paystub"
-                  ? "Paystub mode calls decryptUtxo on the recipient viewing key. That call opens this note. The same 32-byte ViewingKey also opens every other note encrypted to this wallet."
+                  ? "Paystub mode opens notes for one viewing key. If this wallet sent the batch and is not a listed payee, verification opens every output instead of treating the sender's change as the payment."
                   : "Batch audit derives transactionViewingKey(firstNullifier) and calls decryptSlotEphemeral on every slot. That opens sender change and every recipient."}
               </p>
               {verifyMode === "paystub" && (
@@ -1199,7 +1215,7 @@ export function App(): React.ReactElement {
                     </div>
 
                     <div className="cert-meta-item">
-                      <span className="cert-meta-label">Protocol Fee (0.25%)</span>
+                      <span className="cert-meta-label">Protocol Fee ({verificationResult.protocolFee?.bps != null ? `${(verificationResult.protocolFee.bps / 100).toFixed(2)}%` : "0.50%"})</span>
                       <span className="cert-meta-val" style={{ fontSize: "0.85rem" }}>
                         {verificationResult.protocolFee
                           ? `${formatSol(verificationResult.protocolFee.amount ?? verificationResult.protocolFee.amountSol ?? 0)} ${verificationResult.asset || "SOL"}`
@@ -1322,6 +1338,7 @@ export function App(): React.ReactElement {
     return (
       <main className="app-container">
         <header className="nav-header">
+          <p className="demo-banner" role="status">Devnet demo — not for production funds.</p>
           <div className="brand-wrap" onClick={() => setViewMode("landing")}>
             <span className="brand-text">Ciphra</span>
             <span className="brand-pill">Confidential payroll</span>
@@ -1413,6 +1430,7 @@ export function App(): React.ReactElement {
     <main className="app-container">
       {/* Top Navbar */}
       <header className="nav-header">
+        <p className="demo-banner" role="status">Devnet demo — not for production funds.</p>
         <div className="brand-wrap" onClick={() => setViewMode("landing")}>
           <div className="brand-logo">🛡️</div>
           <div>
@@ -1708,6 +1726,13 @@ export function App(): React.ReactElement {
               <span>🔍 [3] Audit Verifier</span>
               <span className="tab-badge">/verify</span>
             </button>
+            <button
+              className={`workspace-tab ${activeTab === "stealth" ? "active" : ""}`}
+              onClick={() => setActiveTab("stealth")}
+            >
+              <span>[4] Stealth Burners (Devnet v1)</span>
+              <span className="tab-badge">{network === "devnet" ? "devnet" : "locked"}</span>
+            </button>
           </div>
 
           {/* TAB 1: PAYROLL DESK */}
@@ -1857,7 +1882,7 @@ export function App(): React.ReactElement {
                     <div className="mono" style={{ fontWeight: 700, color: "var(--text-primary)" }}>{totalPayrollStr}</div>
                   </div>
                   <div>
-                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", textTransform: "uppercase" }}>Ciphra Fee (0.25%)</span>
+                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", textTransform: "uppercase" }}>Ciphra Fee (0.50%)</span>
                     <div className="mono" style={{ fontWeight: 700, color: "#34D399" }}>{ciphraFeeStr}</div>
                   </div>
                   <div>
@@ -2087,6 +2112,164 @@ export function App(): React.ReactElement {
 
           {/* TAB 3: AUDIT VERIFIER */}
           {activeTab === "verify" && verifyView}
+
+          {/* TAB 4: STEALTH BURNERS */}
+          {activeTab === "stealth" && (
+            <div className="card-specular table-panel">
+              <h2 style={{ fontSize: "1.15rem", fontWeight: 700, marginBottom: "0.35rem" }}>
+                Stealth Burners (Devnet v1)
+              </h2>
+              <p style={{ fontSize: "0.825rem", lineHeight: 1.5, marginBottom: "1rem", color: "var(--text-secondary)" }}>
+                Devnet v1 only. Small ring sizes, plus timing and amount correlation, can still trace a burner back to this wallet. The connected wallet still pays transaction fees until a relayer is wired. The burner key is a non-extractable key held in this tab&apos;s memory. Spawn, rotate, sweep, and wipe never write it to localStorage or sessionStorage.
+              </p>
+              {network !== "devnet" && (
+                <p style={{ color: "#FCA5A5", fontSize: "0.85rem", marginBottom: "1rem" }}>
+                  This build is {network}. Stealth burner actions are refused.
+                </p>
+              )}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "1rem" }}>
+                <button
+                  className="btn btn-primary btn-sm"
+                  type="button"
+                  disabled={busy || network !== "devnet"}
+                  onClick={() => {
+                    const previous = burner?.address;
+                    void (async () => {
+                      try {
+                        const next = await createEphemeralBurner(network);
+                        setBurner(next);
+                        setSwapQuote(undefined);
+                        setBurnerNote(previous === undefined
+                          ? `Spawned ${next.address}. The key is only in memory.`
+                          : `Rotated. Dropped ${previous} from memory. Funds still on that address are stranded.`);
+                      } catch (err: unknown) {
+                        setError(err instanceof Error ? err.message : String(err));
+                      }
+                    })();
+                  }}
+                >
+                  {burner === undefined ? "Spawn Disposable Burner" : "Rotate Disposable Burner"}
+                </button>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  type="button"
+                  disabled={busy || burner === undefined}
+                  onClick={() => {
+                    if (burner === undefined) return;
+                    wipeEphemeralBurner(burner);
+                    setBurner(undefined);
+                    setSwapQuote(undefined);
+                    setBurnerNote("Burner key reference dropped. It was not stored in the browser.");
+                  }}
+                >
+                  Wipe Burner Key
+                </button>
+              </div>
+              <p className="mono" style={{ fontSize: "0.8rem", marginBottom: "0.75rem" }}>
+                {burner === undefined ? "No burner in memory." : burner.address}
+              </p>
+              {burnerNote !== "" && (
+                <p className="muted" style={{ fontSize: "0.8rem", marginBottom: "0.75rem" }}>{burnerNote}</p>
+              )}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", alignItems: "center", marginBottom: "0.75rem" }}>
+                <div className="asset-pill-group">
+                  <button type="button" className={`asset-pill-btn ${burnerAsset === "SOL" ? "active-sol" : ""}`} onClick={() => { setBurnerAsset("SOL"); setSwapQuote(undefined); }}>SOL</button>
+                  <button type="button" className={`asset-pill-btn ${burnerAsset === "USDC" ? "active-usdc" : ""}`} onClick={() => { setBurnerAsset("USDC"); setSwapQuote(undefined); }}>USDC</button>
+                </div>
+                <input
+                  className="table-input"
+                  style={{ maxWidth: "10rem" }}
+                  value={burnerAmount}
+                  onChange={(event) => { setBurnerAmount(event.target.value); setSwapQuote(undefined); }}
+                  inputMode="decimal"
+                />
+                <span className="muted" style={{ fontSize: "0.75rem" }}>
+                  Cap {formatAmount(stealthUnshieldCap(burnerAsset), ASSETS[burnerAsset].decimals)} {burnerAsset}
+                </span>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "1rem" }}>
+                <button
+                  className="btn btn-primary btn-sm"
+                  type="button"
+                  disabled={busy || session === undefined || burner === undefined || network !== "devnet"}
+                  onClick={() => {
+                    if (session === undefined || burner === undefined) return;
+                    let parsed: bigint;
+                    try {
+                      parsed = parseAmount(burnerAmount, ASSETS[burnerAsset].decimals);
+                    } catch (err: unknown) {
+                      setError(err instanceof Error ? err.message : String(err));
+                      return;
+                    }
+                    const recipient = burner.address;
+                    void run(`Unshield ${burnerAmount} ${burnerAsset} to burner`, (active) =>
+                      actions.unshieldToRecipient(active, recipient, parsed, ASSETS[burnerAsset].mint),
+                    );
+                  }}
+                >
+                  Unshield capped {burnerAsset} to Burner
+                </button>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  type="button"
+                  disabled={network !== "devnet" || burnerAmount.trim() === ""}
+                  onClick={() => {
+                    try {
+                      const parsed = parseAmount(burnerAmount, ASSETS[burnerAsset].decimals);
+                      const output: AssetSymbol = burnerAsset === "SOL" ? "USDC" : "SOL";
+                      setSwapQuote(quoteStealthBurnerSwapStub(
+                        network,
+                        parsed,
+                        ASSETS[burnerAsset].mint,
+                        ASSETS[output].mint,
+                      ));
+                      setError("");
+                    } catch (err: unknown) {
+                      setSwapQuote(undefined);
+                      setError(err instanceof Error ? err.message : String(err));
+                    }
+                  }}
+                >
+                  Preview Swap + 0.50% Fee Hook
+                </button>
+                <button
+                  className="btn btn-outline-emerald btn-sm"
+                  type="button"
+                  disabled={busy || session === undefined || burner === undefined || network !== "devnet"}
+                  onClick={() => {
+                    if (session === undefined || burner === undefined) return;
+                    const current = burner;
+                    void (async () => {
+                      setBusy(true);
+                      setError("");
+                      try {
+                        const result = await sweepBurnerToShield(session, current, burnerAsset);
+                        setBurner(undefined);
+                        setSwapQuote(undefined);
+                        setBurnerNote(`Swept ${burnerAsset} back to the shielded address. ${result.signature}`);
+                        setState(await snapshot(session, result.slot));
+                      } catch (err: unknown) {
+                        setError(err instanceof Error ? err.message : String(err));
+                      } finally {
+                        setBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  Sweep Back to Shield
+                </button>
+              </div>
+              {swapQuote !== undefined && (
+                <div style={{ fontSize: "0.8rem", lineHeight: 1.5 }}>
+                  <div>Route: {swapQuote.route}</div>
+                  <div>Input: {formatAmount(BigInt(swapQuote.amountBaseUnits), ASSETS[burnerAsset].decimals)} {burnerAsset}</div>
+                  <div>Platform fee ({(swapQuote.feeBps / 100).toFixed(2)}%): {formatAmount(BigInt(swapQuote.platformFeeBaseUnits), ASSETS[burnerAsset].decimals)} {burnerAsset}</div>
+                  <div>Net swap amount: {formatAmount(BigInt(swapQuote.netSwapAmountBaseUnits), ASSETS[burnerAsset].decimals)} {burnerAsset}</div>
+                  <p className="muted" style={{ marginTop: "0.35rem" }}>{swapQuote.note}</p>
+                </div>
+              )}
+            </div>
+          )}
         </>
       )}
 

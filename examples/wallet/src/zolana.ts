@@ -68,8 +68,15 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import { SprWebProver, type Measurement } from "@heliuslabs/spr-web-prover";
 import { signConnectedWalletMessage, type WalletSessionUnlock } from "./burner.js";
 import { deployments, remoteProverConfig, sprEndpoints } from "./deployments";
-import { compareDecryptedAmounts, type AuditIntegrity } from "./compare-decrypted-amounts.js";
+import { auditModeForConnectedWallet, compareDecryptedAmounts, type AuditIntegrity } from "./compare-decrypted-amounts.js";
 import { MAX_LOCAL_INPUTS, limitLocalProofs, localSpendLimit, MERGE_FIRST } from "./local-proving.js";
+import {
+  assertStealthBurnerNetwork,
+  pickProtocolFeeCollector,
+  stealthUnshieldCap,
+  wipeEphemeralBurner,
+  type EphemeralBurner,
+} from "./stealthBurners.js";
 export { compareDecryptedAmounts };
 export type { AuditIntegrity };
 export type { Payment };
@@ -79,6 +86,8 @@ if (selectedNetwork !== "devnet" && selectedNetwork !== "mainnet") {
   throw new Error("VITE_ZOLANA_NETWORK must be devnet or mainnet");
 }
 export const network = selectedNetwork;
+/** 0.50% protocol fee. Payroll defaults to this unless a caller passes another rate. */
+export const DEFAULT_PROTOCOL_FEE_BPS = 50;
 export const networkLabel = network === "devnet" ? "Devnet-e" : "Mainnet";
 const deployment = deployments[network];
 const spr = sprEndpoints(deployment.sprUrl, import.meta.env.VITE_HELIUS_API_KEY ?? "");
@@ -312,15 +321,35 @@ export interface ExecutionResult {
   readonly slot: bigint;
 }
 
-async function submit(session: Session, transaction: Transaction): Promise<ExecutionResult> {
-  const { client, signer } = session;
-  const signed = await signTransactionWithSigners([signer], transaction);
+async function submitSigned(
+  session: Session,
+  transaction: Transaction,
+  signers: readonly SessionSigner[],
+): Promise<ExecutionResult> {
+  const { client } = session;
+  const signed = await signTransactionWithSigners([...signers], transaction);
   await sendTransactionWithoutConfirmingFactory({ rpc: client.solanaRpc })(signed, {
     commitment: client.commitment,
   });
   const signature = getSignatureFromTransaction(signed);
   const slot = await client.confirmTransaction(signature);
   return { signature, slot };
+}
+
+async function submit(session: Session, transaction: Transaction): Promise<ExecutionResult> {
+  return submitSigned(session, transaction, [session.signer]);
+}
+
+/** Devnet falls back to the sender. Any other network requires a distinct treasury. */
+export function resolveProtocolFeeCollector(senderAddress: string, explicit?: string): string {
+  const envCollector = import.meta.env.VITE_PROTOCOL_FEE_COLLECTOR ?? "";
+  return pickProtocolFeeCollector({
+    networkName: network,
+    senderAddress,
+    ...(explicit === undefined ? {} : { explicit }),
+    envCollector,
+    explicitIsAddress: (value) => isAddress(value),
+  });
 }
 
 function checkLocalAmount(wallet: Wallet, amount: bigint, asset: Address = SOL_MINT): void {
@@ -411,6 +440,40 @@ export const actions = {
     });
     return submit(session, transaction);
   },
+  /**
+   * Unshield a capped devnet allowance straight to a public recipient.
+   * Stealth burners use this to fund an ephemeral address from the shielded pool.
+   */
+  async unshieldToRecipient(
+    session: Session,
+    recipient: Address,
+    amount: bigint,
+    asset: Address = SOL_MINT,
+  ): Promise<ExecutionResult> {
+    assertStealthBurnerNetwork(network);
+    if (!isAddress(recipient)) throw new Error("Unshield recipient is not a Solana address.");
+    if (amount <= 0n) throw new Error("Unshield amount must be positive.");
+    const symbol: AssetSymbol | undefined = asset === SOL_MINT ? "SOL" : asset === USDC_MINT ? "USDC" : undefined;
+    if (symbol === undefined) throw new Error("Stealth unshield supports SOL and USDC only.");
+    const cap = stealthUnshieldCap(symbol);
+    if (amount > cap) {
+      throw new Error(
+        `Stealth unshield is capped at ${formatAmount(cap, ASSETS[symbol].decimals)} ${symbol} on devnet.`,
+      );
+    }
+    const { client, wallet, keys, signer } = session;
+    checkLocalAmount(wallet, amount, asset);
+    const transaction = await buildWithdrawalTransaction({
+      client,
+      wallet,
+      keys,
+      feePayer: signer.address,
+      recipient,
+      amount,
+      ...(asset === SOL_MINT ? {} : { asset }),
+    });
+    return submit(session, transaction);
+  },
   async withdraw(session: Session, amount: bigint, asset: Address = SOL_MINT): Promise<ExecutionResult> {
     return this.unshield(session, amount, asset);
   },
@@ -450,6 +513,48 @@ export const actions = {
     return submit(session, transaction);
   },
 };
+
+/**
+ * Re-shields the burner's public balance into the session shielded address.
+ * The connected wallet pays the transaction fee. The burner key is dropped after the deposit lands.
+ * Devnet only.
+ */
+export async function sweepBurnerToShield(
+  session: Session,
+  burner: EphemeralBurner,
+  asset: AssetSymbol = "SOL",
+): Promise<ExecutionResult> {
+  assertStealthBurnerNetwork(network);
+  const mint = ASSETS[asset].mint;
+  let amount: bigint;
+  if (asset === "SOL") {
+    const balance = await session.client.solanaRpc.getBalance(burner.address).send();
+    amount = balance.value;
+    if (amount <= 0n) throw new Error("Burner has no SOL to sweep.");
+  } else {
+    const ata = await getAssociatedTokenAddress(burner.address, mint);
+    let raw = 0n;
+    try {
+      const ataBalance = await session.client.solanaRpc.getTokenAccountBalance(ata).send();
+      raw = BigInt(ataBalance.value.amount);
+    } catch {
+      raw = 0n;
+    }
+    amount = raw;
+    if (amount <= 0n) throw new Error("Burner has no USDC to sweep.");
+  }
+  const transaction = await buildDepositTransaction({
+    client: session.client,
+    feePayer: session.signer.address,
+    depositor: burner.address,
+    recipient: session.shieldedAddress,
+    amount,
+    ...(mint === SOL_MINT ? {} : { asset: mint }),
+  });
+  const result = await submitSigned(session, transaction, [session.signer, burner.signer]);
+  wipeEphemeralBurner(burner);
+  return result;
+}
 
 const PAYROLL_JOURNAL_STORAGE_KEY = "ciphra_payroll_journal";
 const MAX_JOURNAL_RUNS = 20;
@@ -900,7 +1005,7 @@ async function resumeSubmittedChunk(session: Session, chunk: JournalChunk): Prom
 
 /**
  * Executes batch payroll using buildMultiTransferTransaction.
- * Max 14 recipients per chunk to leave the 15th slot for the 0.25% protocol fee.
+ * Max 14 recipients per chunk to leave the 15th slot for the 0.50% protocol fee.
  * The journal is written before the first send and deleted once every chunk is confirmed.
  */
 export async function runBatchPayroll(
@@ -918,11 +1023,11 @@ export async function runBatchPayroll(
   const assetConfig = ASSETS[assetSymbol];
   const { decimals, mint } = assetConfig;
   const {
-    protocolFeeBps = 25,
-    feeCollector = session.signer.address,
+    protocolFeeBps = DEFAULT_PROTOCOL_FEE_BPS,
     antiCorrelationJitter = false,
     onProgress,
   } = options;
+  const feeCollector = resolveProtocolFeeCollector(session.signer.address, options.feeCollector);
 
   if (recipients.length === 0) {
     throw new Error("No recipients provided for payroll run");
@@ -1257,6 +1362,7 @@ export async function computeReceiptCommitmentHash(fields: {
         ? {
             collector: c.protocolFee.collector || c.protocolFee.recipient || "",
             amount: c.protocolFee.amount ?? c.protocolFee.amountSol ?? 0,
+            // Receipts written before the 50 bps fee omitted `bps`. Keep 25 so those digests stay valid.
             bps: c.protocolFee.bps ?? 25,
           }
         : null,
@@ -1455,7 +1561,7 @@ async function readSettledTransaction(session: Session, signature: string): Prom
     response = await session.client.solanaRpc.getTransaction(signature as Signature, {
       commitment: "confirmed",
       encoding: "json",
-      maxSupportedTransactionVersion: 0,
+      maxSupportedTransactionVersion: 1,
     }).send();
   } catch (error) {
     throw new Error(
@@ -1802,7 +1908,7 @@ export async function verifyAuditReceipt(
         .getTransaction(txSig as Signature, {
           commitment: "confirmed",
           encoding: "json",
-          maxSupportedTransactionVersion: 0,
+          maxSupportedTransactionVersion: 1,
         })
         .send();
 
@@ -1946,20 +2052,42 @@ export async function verifyAuditReceipt(
     commitmentVerified = true;
   }
 
-  const decryptedOutputs: DecryptedNote[] = [];
-  for (const chunk of rawChunks) {
-    const indexed = await client.getShieldedTransactionsBySignature(chunk.txSignature as Signature);
-    if (indexed.transactions.length === 0) {
-      throw new Error(`The shielded indexer has no event for ${chunk.txSignature}.`);
-    }
-    for (const event of indexed.transactions) {
-      decryptedOutputs.push(...await decryptIndexedTransaction(session, event.transaction, options));
-    }
-  }
-
   const senderShieldedAddress = hexBytes(session.shieldedAddress.toBytes());
-  const audit = compareDecryptedAmounts(options.mode, decryptedOutputs, rawChunks, decimals, {
-    ...(options.mode === "paystub" && options.useSessionKey === true
+  // Paystub mode opens only notes encrypted to one viewing key. The wallet that
+  // sent the batch is not a payee, so those notes are its change and the
+  // contractors' shielded addresses look "missing". A sender verifies the batch
+  // by opening every output. A listed recipient stays on the one-note path.
+  const compareMode = options.useSessionKey === true
+    ? auditModeForConnectedWallet(options.mode, senderShieldedAddress, rawChunks)
+    : options.mode;
+  const decryptOptions: VerifyAuditOptions = compareMode === options.mode
+    ? options
+    : {
+        mode: compareMode,
+        ...(options.viewingKey !== undefined ? { viewingKey: options.viewingKey } : {}),
+        ...(options.useSessionKey === true ? { useSessionKey: true as const } : {}),
+      };
+  const decryptedOutputs: DecryptedNote[] = [];
+  try {
+    for (const chunk of rawChunks) {
+      const indexed = await client.getShieldedTransactionsBySignature(chunk.txSignature as Signature);
+      if (indexed.transactions.length === 0) {
+        throw new Error(`The shielded indexer has no event for ${chunk.txSignature}.`);
+      }
+      for (const event of indexed.transactions) {
+        decryptedOutputs.push(...await decryptIndexedTransaction(session, event.transaction, decryptOptions));
+      }
+    }
+  } catch (error) {
+    if (compareMode === "employer" && options.mode === "paystub" && errorText(error).includes("did not author")) {
+      throw new Error(
+        "This wallet is not a recipient on the receipt, and it did not author the transaction. Open a paystub with that recipient's viewing key.",
+      );
+    }
+    throw error;
+  }
+  const audit = compareDecryptedAmounts(compareMode, decryptedOutputs, rawChunks, decimals, {
+    ...(compareMode === "paystub" && options.useSessionKey === true
       ? { paystubShieldedAddress: senderShieldedAddress }
       : {}),
     senderAddress: detectedOnChainSigner || session.signer.address,
@@ -1973,11 +2101,17 @@ export async function verifyAuditReceipt(
     amountLamports: note.amountBaseUnits,
     memo: `${note.role} · slot ${note.slotIndex} · ${note.mint}`,
   }));
-  const totalBase = decryptedOutputs.reduce((sum, note) => sum + BigInt(note.amountBaseUnits), 0n);
+  // Headline disbursement is recipient payouts. Sender change and a sender-owned
+  // protocol fee share the sender-change role and stay in the per-note table.
+  // Paystub decryption labels the same payout opened-note.
+  const totalBase = decryptedOutputs.reduce((sum, note) => {
+    if (note.role === "sender-change") return sum;
+    return sum + BigInt(note.amountBaseUnits);
+  }, 0n);
 
   return {
     valid: audit.integrity === "VERIFIED",
-    mode: options.mode,
+    mode: compareMode,
     integrity: audit.integrity,
     ...(audit.reason ? { tamperReason: audit.reason } : {}),
     decryptedOutputs,
