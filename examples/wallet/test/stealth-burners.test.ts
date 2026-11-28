@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  JUPITER_USDC_MINT,
   STEALTH_BURNER_FEE_BPS,
+  WSOL_MINT,
   calculateStealthFee,
+  clampStealthSwapAmount,
   createEphemeralBurner,
+  liveJupiterEnabled,
   pickProtocolFeeCollector,
   quoteStealthBurnerSwapStub,
+  selectJupiterFeeAccount,
   wipeEphemeralBurner,
 } from "../src/stealthBurners.ts";
 
@@ -78,6 +83,56 @@ test("protocol fee collector does not fall back to the sender off devnet", () =>
     }),
     TREASURY,
   );
+});
+
+test("jupiter fee account follows the WSOL or USDC side and rejects other pairs", () => {
+  const wsolAta = "WsolFeeAccount11111111111111111111111111111111";
+  const usdcAta = "UsdcFeeAccount1111111111111111111111111111111";
+  assert.equal(selectJupiterFeeAccount({
+    inputMint: JUPITER_USDC_MINT,
+    outputMint: WSOL_MINT,
+    wsolAta,
+    usdcAta,
+  }), wsolAta);
+  assert.equal(selectJupiterFeeAccount({
+    inputMint: WSOL_MINT,
+    outputMint: JUPITER_USDC_MINT,
+    wsolAta,
+    usdcAta,
+  }), usdcAta);
+  assert.equal(selectJupiterFeeAccount({
+    inputMint: WSOL_MINT,
+    outputMint: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    wsolAta,
+  }), wsolAta);
+  assert.throws(
+    () => selectJupiterFeeAccount({
+      inputMint: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+      outputMint: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+      wsolAta,
+      usdcAta,
+    }),
+    /neither/,
+  );
+  assert.throws(
+    () => selectJupiterFeeAccount({ inputMint: JUPITER_USDC_MINT, outputMint: WSOL_MINT }),
+    /VITE_FEE_ATA_WSOL/,
+  );
+  assert.equal(liveJupiterEnabled("devnet", undefined), false);
+  assert.equal(liveJupiterEnabled("devnet", "true"), true);
+  assert.equal(liveJupiterEnabled("mainnet", undefined), true);
+  assert.equal(clampStealthSwapAmount({
+    requested: 1_000n,
+    burnerBalance: 5_000n,
+    networkName: "devnet",
+    asset: "SOL",
+  }), 1_000n);
+  assert.throws(() => clampStealthSwapAmount({
+    requested: 200_000_000n,
+    burnerBalance: 500_000_000n,
+    networkName: "devnet",
+    asset: "SOL",
+  }), /devnet cap/);
 });
 
 test("ephemeral burner stays in memory and is devnet-only", async () => {

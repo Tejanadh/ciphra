@@ -3,7 +3,7 @@
   "buildCommand": "npm run build:prover && npm run build:wallet",
   "outputDirectory": "examples/wallet/dist",
   "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
   ],
   "headers": [
     {

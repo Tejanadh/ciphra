@@ -1,8 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { formatAmount, parseAmount } from "@heliuslabs/spr";
-import { isAddress } from "@solana/kit";
+import { getAssociatedTokenAddress } from "@heliuslabs/spr/addresses";
+import { address, isAddress } from "@solana/kit";
 import {
+  JUPITER_USDC_MINT,
+  RELAYER_UNAVAILABLE_NOTICE,
+  WSOL_MINT,
+  clampStealthSwapAmount,
   createEphemeralBurner,
+  executeStealthBurnerSwap,
+  fetchRelayerStatus,
+  liveJupiterEnabled,
+  quoteLiveJupiterSwap,
   quoteStealthBurnerSwapStub,
   stealthUnshieldCap,
   wipeEphemeralBurner,
@@ -257,6 +266,9 @@ export function App(): React.ReactElement {
   const [burnerAmount, setBurnerAmount] = useState("0.01");
   const [swapQuote, setSwapQuote] = useState<StealthSwapQuote>();
   const [burnerNote, setBurnerNote] = useState("");
+  const [relayerPubkey, setRelayerPubkey] = useState<string>();
+  const [relayerNotice, setRelayerNotice] = useState(RELAYER_UNAVAILABLE_NOTICE);
+  const liveJupiter = liveJupiterEnabled(network, import.meta.env.VITE_ENABLE_LIVE_JUPITER);
 
   // Switch active asset and populate corresponding amounts
   const handleSelectAsset = (asset: AssetSymbol) => {
@@ -427,6 +439,24 @@ export function App(): React.ReactElement {
       window.clearTimeout(handle);
     };
   }, [session, activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "stealth") return;
+    let cancelled = false;
+    void fetchRelayerStatus().then((status) => {
+      if (cancelled) return;
+      if (status.active) {
+        setRelayerPubkey(status.pubkey);
+        setRelayerNotice("Relayer fee-payer is active. The connected wallet does not sign as fee payer for unshield or sweep. The transaction includes a 0.005 SOL reimbursement to the relayer.");
+      } else {
+        setRelayerPubkey(undefined);
+        setRelayerNotice(status.notice);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
 
   const run = async (label: string, action: (s: Session) => Promise<bigint | ExecutionResult | undefined>) => {
     if (session === undefined || busy) return;
@@ -2119,24 +2149,22 @@ export function App(): React.ReactElement {
               <h2 style={{ fontSize: "1.15rem", fontWeight: 700, marginBottom: "0.35rem" }}>
                 Stealth Burners (Devnet v1)
               </h2>
-              <p style={{ fontSize: "0.825rem", lineHeight: 1.5, marginBottom: "1rem", color: "var(--text-secondary)" }}>
-                Devnet v1 only. Small ring sizes, plus timing and amount correlation, can still trace a burner back to this wallet. The connected wallet still pays transaction fees until a relayer is wired. The burner key is a non-extractable key held in this tab&apos;s memory. Spawn, rotate, sweep, and wipe never write it to localStorage or sessionStorage.
+              <p style={{ fontSize: "0.825rem", lineHeight: 1.5, marginBottom: "0.5rem", color: "var(--text-secondary)" }}>
+                {relayerNotice} Small ring sizes, plus timing and amount correlation, can still trace a burner back to this wallet. The burner key is a non-extractable key held in this tab&apos;s memory. Spawn, rotate, sweep, and wipe never write it to localStorage or sessionStorage. Mainnet stays locked unless VITE_ENABLE_MAINNET=true.
               </p>
-              {network !== "devnet" && (
-                <p style={{ color: "#FCA5A5", fontSize: "0.85rem", marginBottom: "1rem" }}>
-                  This build is {network}. Stealth burner actions are refused.
-                </p>
-              )}
+              <p className="mono" style={{ fontSize: "0.75rem", marginBottom: "1rem" }}>
+                {relayerPubkey === undefined ? "Relayer fee-payer: fallback (connected wallet)" : `Relayer fee-payer: ${relayerPubkey}`}
+              </p>
               <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "1rem" }}>
                 <button
                   className="btn btn-primary btn-sm"
                   type="button"
-                  disabled={busy || network !== "devnet"}
+                  disabled={busy}
                   onClick={() => {
                     const previous = burner?.address;
                     void (async () => {
                       try {
-                        const next = await createEphemeralBurner(network);
+                        const next = await createEphemeralBurner(network, network === "mainnet");
                         setBurner(next);
                         setSwapQuote(undefined);
                         setBurnerNote(previous === undefined
@@ -2191,7 +2219,7 @@ export function App(): React.ReactElement {
                 <button
                   className="btn btn-primary btn-sm"
                   type="button"
-                  disabled={busy || session === undefined || burner === undefined || network !== "devnet"}
+                  disabled={busy || session === undefined || burner === undefined}
                   onClick={() => {
                     if (session === undefined || burner === undefined) return;
                     let parsed: bigint;
@@ -2212,30 +2240,83 @@ export function App(): React.ReactElement {
                 <button
                   className="btn btn-secondary btn-sm"
                   type="button"
-                  disabled={network !== "devnet" || burnerAmount.trim() === ""}
+                  disabled={burnerAmount.trim() === "" || (liveJupiter && (session === undefined || burner === undefined))}
                   onClick={() => {
-                    try {
-                      const parsed = parseAmount(burnerAmount, ASSETS[burnerAsset].decimals);
-                      const output: AssetSymbol = burnerAsset === "SOL" ? "USDC" : "SOL";
-                      setSwapQuote(quoteStealthBurnerSwapStub(
-                        network,
-                        parsed,
-                        ASSETS[burnerAsset].mint,
-                        ASSETS[output].mint,
-                      ));
+                    const currentSession = session;
+                    const currentBurner = burner;
+                    const jupiterConfig = {
+                      networkName: network,
+                      ...(import.meta.env.VITE_ENABLE_LIVE_JUPITER === undefined
+                        ? {}
+                        : { liveJupiterFlag: import.meta.env.VITE_ENABLE_LIVE_JUPITER }),
+                      ...(import.meta.env.VITE_FEE_ATA_WSOL === undefined
+                        ? {}
+                        : { wsolAta: import.meta.env.VITE_FEE_ATA_WSOL }),
+                      ...(import.meta.env.VITE_FEE_ATA_USDC === undefined
+                        ? {}
+                        : { usdcAta: import.meta.env.VITE_FEE_ATA_USDC }),
+                    };
+                    void (async () => {
                       setError("");
-                    } catch (err: unknown) {
-                      setSwapQuote(undefined);
-                      setError(err instanceof Error ? err.message : String(err));
-                    }
+                      try {
+                        const requested = parseAmount(burnerAmount, ASSETS[burnerAsset].decimals);
+                        let burnerBalance = stealthUnshieldCap(burnerAsset);
+                        if (currentSession !== undefined && currentBurner !== undefined) {
+                          if (burnerAsset === "SOL") {
+                            burnerBalance = (await currentSession.client.solanaRpc.getBalance(currentBurner.address).send()).value;
+                          } else {
+                            const mint = address(liveJupiter ? JUPITER_USDC_MINT : ASSETS.USDC.mint);
+                            const ata = await getAssociatedTokenAddress(currentBurner.address, mint);
+                            try {
+                              const token = await currentSession.client.solanaRpc.getTokenAccountBalance(ata).send();
+                              burnerBalance = BigInt(token.value.amount);
+                            } catch {
+                              burnerBalance = 0n;
+                            }
+                          }
+                        }
+                        const amount = clampStealthSwapAmount({
+                          requested,
+                          burnerBalance,
+                          networkName: network,
+                          asset: burnerAsset,
+                        });
+                        const output: AssetSymbol = burnerAsset === "SOL" ? "USDC" : "SOL";
+                        if (!liveJupiter) {
+                          setSwapQuote(quoteStealthBurnerSwapStub(
+                            network,
+                            amount,
+                            ASSETS[burnerAsset].mint,
+                            ASSETS[output].mint,
+                          ));
+                          return;
+                        }
+                        if (currentSession === undefined || currentBurner === undefined) {
+                          throw new Error("Spawn a burner and connect a wallet before a live swap.");
+                        }
+                        setBusy(true);
+                        const inputMint = burnerAsset === "SOL" ? WSOL_MINT : JUPITER_USDC_MINT;
+                        const outputMint = output === "SOL" ? WSOL_MINT : JUPITER_USDC_MINT;
+                        const quote = await quoteLiveJupiterSwap(network, amount, inputMint, outputMint, jupiterConfig);
+                        const result = await executeStealthBurnerSwap(currentBurner, quote, {
+                          send: (wire) => currentSession.client.solanaRpc.sendTransaction(wire, { encoding: "base64" }).send(),
+                        }, jupiterConfig);
+                        setBurnerNote(`Jupiter swap submitted. ${result.signature}`);
+                      } catch (err: unknown) {
+                        setSwapQuote(undefined);
+                        setError(err instanceof Error ? err.message : String(err));
+                      } finally {
+                        setBusy(false);
+                      }
+                    })();
                   }}
                 >
-                  Preview Swap + 0.50% Fee Hook
+                  {liveJupiter ? "Swap on Jupiter + 0.50% Fee" : "Preview Swap + 0.50% Fee Hook"}
                 </button>
                 <button
                   className="btn btn-outline-emerald btn-sm"
                   type="button"
-                  disabled={busy || session === undefined || burner === undefined || network !== "devnet"}
+                  disabled={busy || session === undefined || burner === undefined}
                   onClick={() => {
                     if (session === undefined || burner === undefined) return;
                     const current = burner;
