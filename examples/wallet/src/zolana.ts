@@ -49,7 +49,9 @@ import {
   getAddressEncoder,
   getBase58Decoder,
   getBase58Encoder,
+  getBase64EncodedWireTransaction,
   getSignatureFromTransaction,
+  partiallySignTransactionWithSigners,
   assertIsTransactionWithBlockhashLifetime,
   isAddress,
   isKeyPairSigner,
@@ -70,10 +72,13 @@ import { signConnectedWalletMessage, type WalletSessionUnlock } from "./burner.j
 import { deployments, remoteProverConfig, sprEndpoints } from "./deployments";
 import { auditModeForConnectedWallet, compareDecryptedAmounts, type AuditIntegrity } from "./compare-decrypted-amounts.js";
 import { MAX_LOCAL_INPUTS, limitLocalProofs, localSpendLimit, MERGE_FIRST } from "./local-proving.js";
+import { withRelayerReimbursement, RELAYER_FEE_LAMPORTS } from "./relayerPolicy.js";
 import {
   assertStealthBurnerNetwork,
+  fetchRelayerStatus,
   pickProtocolFeeCollector,
   stealthUnshieldCap,
+  submitRelayedTransaction,
   wipeEphemeralBurner,
   type EphemeralBurner,
 } from "./stealthBurners.js";
@@ -84,6 +89,11 @@ export type { Payment };
 const selectedNetwork: string = import.meta.env.VITE_ZOLANA_NETWORK ?? "devnet";
 if (selectedNetwork !== "devnet" && selectedNetwork !== "mainnet") {
   throw new Error("VITE_ZOLANA_NETWORK must be devnet or mainnet");
+}
+/** Mainnet stays off unless this build was explicitly unlocked after review. */
+export const mainnetUnlocked = import.meta.env.VITE_ENABLE_MAINNET === "true";
+if (selectedNetwork === "mainnet" && !mainnetUnlocked) {
+  throw new Error("Mainnet is locked. Set VITE_ENABLE_MAINNET=true only after it has been tested and reviewed.");
 }
 export const network = selectedNetwork;
 /** 0.50% protocol fee. Payroll defaults to this unless a caller passes another rate. */
@@ -340,6 +350,20 @@ async function submit(session: Session, transaction: Transaction): Promise<Execu
   return submitSigned(session, transaction, [session.signer]);
 }
 
+async function submitViaRelayer(
+  session: Session,
+  transaction: Transaction,
+  signers: readonly SessionSigner[],
+  reimbursementSource: SessionSigner,
+  relayer: Address,
+): Promise<ExecutionResult> {
+  const withFee = withRelayerReimbursement(transaction, reimbursementSource, relayer);
+  const partial = await partiallySignTransactionWithSigners([...signers], withFee);
+  const signature = await submitRelayedTransaction(getBase64EncodedWireTransaction(partial));
+  const slot = await session.client.confirmTransaction(signature as Signature);
+  return { signature, slot };
+}
+
 /** Devnet falls back to the sender. Any other network requires a distinct treasury. */
 export function resolveProtocolFeeCollector(senderAddress: string, explicit?: string): string {
   const envCollector = import.meta.env.VITE_PROTOCOL_FEE_COLLECTOR ?? "";
@@ -450,29 +474,32 @@ export const actions = {
     amount: bigint,
     asset: Address = SOL_MINT,
   ): Promise<ExecutionResult> {
-    assertStealthBurnerNetwork(network);
+    assertStealthBurnerNetwork(network, mainnetUnlocked);
     if (!isAddress(recipient)) throw new Error("Unshield recipient is not a Solana address.");
     if (amount <= 0n) throw new Error("Unshield amount must be positive.");
     const symbol: AssetSymbol | undefined = asset === SOL_MINT ? "SOL" : asset === USDC_MINT ? "USDC" : undefined;
     if (symbol === undefined) throw new Error("Stealth unshield supports SOL and USDC only.");
     const cap = stealthUnshieldCap(symbol);
-    if (amount > cap) {
+    if (network === "devnet" && amount > cap) {
       throw new Error(
         `Stealth unshield is capped at ${formatAmount(cap, ASSETS[symbol].decimals)} ${symbol} on devnet.`,
       );
     }
     const { client, wallet, keys, signer } = session;
     checkLocalAmount(wallet, amount, asset);
+    const relayer = await fetchRelayerStatus();
+    const feePayer = relayer.active ? relayer.pubkey : signer.address;
     const transaction = await buildWithdrawalTransaction({
       client,
       wallet,
       keys,
-      feePayer: signer.address,
+      feePayer,
       recipient,
       amount,
       ...(asset === SOL_MINT ? {} : { asset }),
     });
-    return submit(session, transaction);
+    if (!relayer.active) return submit(session, transaction);
+    return submitViaRelayer(session, transaction, [signer], signer, relayer.pubkey);
   },
   async withdraw(session: Session, amount: bigint, asset: Address = SOL_MINT): Promise<ExecutionResult> {
     return this.unshield(session, amount, asset);
@@ -516,20 +543,27 @@ export const actions = {
 
 /**
  * Re-shields the burner's public balance into the session shielded address.
- * The connected wallet pays the transaction fee. The burner key is dropped after the deposit lands.
- * Devnet only.
+ * The relayer pays the network fee when it is configured. Otherwise the connected wallet does.
+ * The burner key is dropped after the deposit lands. Mainnet requires the unlock flag.
  */
 export async function sweepBurnerToShield(
   session: Session,
   burner: EphemeralBurner,
   asset: AssetSymbol = "SOL",
 ): Promise<ExecutionResult> {
-  assertStealthBurnerNetwork(network);
+  assertStealthBurnerNetwork(network, mainnetUnlocked);
   const mint = ASSETS[asset].mint;
+  const relayer = await fetchRelayerStatus();
   let amount: bigint;
   if (asset === "SOL") {
     const balance = await session.client.solanaRpc.getBalance(burner.address).send();
     amount = balance.value;
+    if (relayer.active) {
+      if (amount <= RELAYER_FEE_LAMPORTS) {
+        throw new Error("Burner needs more than 0.005 SOL to reimburse the relayer and sweep the rest.");
+      }
+      amount -= RELAYER_FEE_LAMPORTS;
+    }
     if (amount <= 0n) throw new Error("Burner has no SOL to sweep.");
   } else {
     const ata = await getAssociatedTokenAddress(burner.address, mint);
@@ -542,16 +576,25 @@ export async function sweepBurnerToShield(
     }
     amount = raw;
     if (amount <= 0n) throw new Error("Burner has no USDC to sweep.");
+    if (relayer.active) {
+      const sol = await session.client.solanaRpc.getBalance(burner.address).send();
+      if (sol.value < RELAYER_FEE_LAMPORTS) {
+        throw new Error("Burner needs 0.005 SOL to reimburse the relayer.");
+      }
+    }
   }
+  const feePayer = relayer.active ? relayer.pubkey : session.signer.address;
   const transaction = await buildDepositTransaction({
     client: session.client,
-    feePayer: session.signer.address,
+    feePayer,
     depositor: burner.address,
     recipient: session.shieldedAddress,
     amount,
     ...(mint === SOL_MINT ? {} : { asset: mint }),
   });
-  const result = await submitSigned(session, transaction, [session.signer, burner.signer]);
+  const result = relayer.active
+    ? await submitViaRelayer(session, transaction, [burner.signer], burner.signer, relayer.pubkey)
+    : await submitSigned(session, transaction, [session.signer, burner.signer]);
   wipeEphemeralBurner(burner);
   return result;
 }
