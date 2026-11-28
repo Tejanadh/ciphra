@@ -2,14 +2,15 @@
 
 Devnet demo of a payroll app on Solana Privacy Rings (`@heliuslabs/spr`).
 
-It submits shielded transfers with `buildMultiTransferTransaction`. That proof hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit. The fee-paying Solana account is still the transaction signer.
+It submits shielded transfers with `buildMultiTransferTransaction`. The Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit. The connected wallet signs as the fee payer.
 
 `/verify` checks a receipt against decrypted notes. Zero decrypted notes are `FAILED`. A payout line without a shielded address is unsupported. Employer mode matches each output's viewing key and amount.
 
 ## Limitations
 
 - Devnet demo only. The mainnet path is untested. Do not send production funds.
-- Recipients stay visible. The Helius Default Ring hides amounts, not recipient addresses. Hiding recipient addresses requires Custom Rings, which are still in audit.
+- Amounts-only privacy. The Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit.
+- The connected wallet signs as the fee payer. There is no relayer.
 - Single signer. Multisig and Squads are not supported yet. That is on the roadmap.
 - Alpha SDK: `@heliuslabs/spr@0.9.0-alpha`.
 - The first load is slow. The browser downloads the prover WASM and the proving keys before a payroll proof can run.

@@ -2,6 +2,10 @@
 
 Devnet demo. The product notes live in the repository [README](../../README.md).
 
-`buildMultiTransferTransaction` hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit. The fee-paying Solana account remains the transaction signer.
+`buildMultiTransferTransaction` uses the Default Ring. The Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit.
 
-This app is a devnet demo, not a production deployment. Do not send production funds.
+## Limitations
+
+- Devnet demo only. Do not send production funds.
+- Amounts-only privacy. The Default Ring hides amounts, not recipients. Hiding recipient addresses requires Custom Rings, which are still in audit.
+- The connected wallet signs as the fee payer. There is no relayer.
